@@ -70,6 +70,7 @@ def run_pipeline(
     end_date: _dt.date,
     years_per_time_chunk: int,
     on_progress: Optional[ProgressCallback] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
 ) -> dict:
     """Runs the full batch loop for a given point set and date range.
 
@@ -79,9 +80,14 @@ def run_pipeline(
     fresh; see run_full_mode), already-completed batches are skipped instead
     of re-fetched, and the store is not re-initialized (which would wipe it).
 
+    should_stop(), if given, is checked before each batch — a deliberate stop
+    uses the exact same checkpoint/resume machinery as an unplanned
+    interruption: whatever's already written stays written, and a later run
+    with the same parameters picks up right where this one stopped.
+
     on_progress(ProgressInfo), if given, is called after each fetched+written
     batch. Returns a summary dict:
-    {n_points, n_batches, resumed_from, bytes_downloaded, elapsed_sec, failures: [...]}.
+    {n_points, n_batches, resumed_from, stopped, bytes_downloaded, elapsed_sec, failures: [...]}.
     """
     point_batches = list(_iter_point_batches(points, config.batch_size))
     time_chunks = list(_iter_time_chunks(start_date, end_date, years_per_time_chunk))
@@ -116,9 +122,14 @@ def run_pipeline(
     flat_steps = [(batch, chunk_start, chunk_end)
                   for batch in point_batches for chunk_start, chunk_end in time_chunks]
 
+    stopped = False
     for idx, (batch, chunk_start, chunk_end) in enumerate(flat_steps):
         if idx < resumed_from:
             continue  # already fetched and written in a previous run
+
+        if should_stop is not None and should_stop():
+            stopped = True
+            break  # leave this and later batches for a future resumed run
 
         point_start = int(batch["point_id"].iloc[0])
         point_stop = int(batch["point_id"].iloc[-1]) + 1
@@ -193,8 +204,10 @@ def run_pipeline(
     return {
         "n_points": len(points),
         "n_batches": total_steps,
+        "completed_steps": step,
         "resumed_from": resumed_from,
         "already_complete": resumed_from >= total_steps,
+        "stopped": stopped,
         "bytes_downloaded": bytes_downloaded,
         "elapsed_sec": time.monotonic() - start_time,
         "failures": failures,
@@ -310,18 +323,28 @@ def _resolve_end_date(config: Config, points: pd.DataFrame, years_per_time_chunk
     return config.end_date()
 
 
-def run_test_mode(config: Config, on_progress: Optional[ProgressCallback] = None) -> dict:
+def run_test_mode(
+    config: Config,
+    on_progress: Optional[ProgressCallback] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
+) -> dict:
     points = grid.generate_test_grid(config, TEST_MODE_POINTS)
     end_date = _resolve_end_date(config, points, config.time_chunk_years)
     start_date = (pd.Timestamp(end_date) - pd.DateOffset(years=TEST_MODE_YEARS)).date()
     return run_pipeline(config, points, start_date, end_date,
-                         years_per_time_chunk=config.time_chunk_years, on_progress=on_progress)
+                         years_per_time_chunk=config.time_chunk_years,
+                         on_progress=on_progress, should_stop=should_stop)
 
 
-def run_full_mode(config: Config, on_progress: Optional[ProgressCallback] = None) -> dict:
+def run_full_mode(
+    config: Config,
+    on_progress: Optional[ProgressCallback] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
+) -> dict:
     points = grid.generate_full_grid(config)
     end_date = _resolve_end_date(config, points, config.time_chunk_years)
     return run_pipeline(
         config, points, config.archive_start_date, end_date,
-        years_per_time_chunk=config.time_chunk_years, on_progress=on_progress,
+        years_per_time_chunk=config.time_chunk_years,
+        on_progress=on_progress, should_stop=should_stop,
     )

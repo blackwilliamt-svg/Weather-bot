@@ -19,7 +19,7 @@ dashboard are future phases — see "Seam for future phases" below.
 
 ## Running it
 
-Double-click **`WeatherBot.bat`**. A window opens with three buttons:
+Double-click **`WeatherBot.bat`**. A window opens with four buttons:
 
 - **Run Test Pull** — 20 grid points, last 10 years of data. Finishes in a
   couple of minutes; use this to confirm everything works before committing
@@ -35,6 +35,11 @@ Double-click **`WeatherBot.bat`**. A window opens with three buttons:
 - **Show Inventory** — pick any `.zarr` folder under `data/` and see what's in
   it so far: point count, date range, variables, and size on disk — without
   loading the actual weather data into memory.
+- **Stop** — only enabled while a pull is running. Finishes whatever batch is
+  currently in flight, then halts cleanly — nothing is lost or corrupted, and
+  it's exactly as resumable as an unplanned interruption (see "Interruptions
+  and resuming" below). Click the same run button again later to continue
+  from where it stopped.
 
 The window shows a progress bar, a running log, and live stats (files
 fetched, data downloaded, elapsed/estimated time remaining) while a pull is

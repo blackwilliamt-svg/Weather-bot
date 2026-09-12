@@ -35,6 +35,7 @@ class WeatherBotApp:
         self.root.geometry("760x480")
         self.msg_queue: "queue.Queue[tuple[str, object]]" = queue.Queue()
         self.running = False
+        self.stop_event = threading.Event()
 
         self._build_widgets()
         self.root.after(100, self._poll_queue)
@@ -46,9 +47,11 @@ class WeatherBotApp:
         self.test_btn = ttk.Button(top, text="Run Test Pull", command=self.run_test)
         self.full_btn = ttk.Button(top, text="Run Full Pull", command=self.run_full)
         self.inventory_btn = ttk.Button(top, text="Show Inventory", command=self.show_inventory)
+        self.stop_btn = ttk.Button(top, text="Stop", command=self.stop_run, state="disabled")
         self.test_btn.pack(side="left", padx=(0, 8))
         self.full_btn.pack(side="left", padx=(0, 8))
-        self.inventory_btn.pack(side="left")
+        self.inventory_btn.pack(side="left", padx=(0, 8))
+        self.stop_btn.pack(side="left")
 
         self.status_var = tk.StringVar(value="Idle")
         ttk.Label(top, textvariable=self.status_var).pack(side="right")
@@ -77,6 +80,8 @@ class WeatherBotApp:
         self.test_btn.configure(state=state)
         self.full_btn.configure(state=state)
         self.inventory_btn.configure(state=state)
+        if enabled:
+            self.stop_btn.configure(state="disabled")
 
     def _poll_queue(self) -> None:
         try:
@@ -141,11 +146,21 @@ class WeatherBotApp:
         if self.running:
             return
         self.running = True
+        self.stop_event.clear()
         self._set_buttons_enabled(False)
+        self.stop_btn.configure(state="normal")
         self.progress["value"] = 0
         self.status_var.set(f"Running {mode} pull...")
         self._append_log(f"--- Starting {mode} pull ---")
         threading.Thread(target=self._run_worker, args=(mode,), daemon=True).start()
+
+    def stop_run(self) -> None:
+        if not self.running:
+            return
+        self.stop_event.set()
+        self.stop_btn.configure(state="disabled")
+        self.status_var.set("Stopping... (finishing current batch)")
+        self._append_log("--- Stop requested: finishing the current batch, then stopping (resumable) ---")
 
     def _run_worker(self, mode: str) -> None:
         try:
@@ -161,9 +176,9 @@ class WeatherBotApp:
                 ))
 
             if mode == "test":
-                summary = pipeline.run_test_mode(config, on_progress=on_progress)
+                summary = pipeline.run_test_mode(config, on_progress=on_progress, should_stop=self.stop_event.is_set)
             else:
-                summary = pipeline.run_full_mode(config, on_progress=on_progress)
+                summary = pipeline.run_full_mode(config, on_progress=on_progress, should_stop=self.stop_event.is_set)
 
             failure_text = pipeline.format_failure_summary(summary)
             log_path = pipeline.write_failure_log(summary, config.store_path)
@@ -181,6 +196,21 @@ class WeatherBotApp:
         summary = payload["summary"]
         downloaded = pipeline.format_bytes(summary["bytes_downloaded"])
         elapsed = pipeline.format_duration(summary["elapsed_sec"])
+
+        if summary["stopped"]:
+            self._append_log(
+                f"--- Stopped: {summary['completed_steps']}/{summary['n_batches']} files done, "
+                f"{downloaded} downloaded this session in {elapsed}. Resumable — click the same "
+                "run button again to continue from here. ---"
+            )
+            self.stats_var.set(f"Stopped: {summary['completed_steps']}/{summary['n_batches']} files")
+            messagebox.showinfo(
+                "WeatherBot",
+                f"Stopped.\n{summary['completed_steps']} of {summary['n_batches']} files fetched "
+                f"before stopping.\nStore: {payload['store_path']}\n\n"
+                "This is resumable — run the same pull again to continue where it left off.",
+            )
+            return
 
         if summary["already_complete"]:
             self._append_log(
