@@ -25,6 +25,7 @@ def build_parser() -> argparse.ArgumentParser:
     fetch_p.add_argument("--batch-size", type=int, default=None)
     fetch_p.add_argument("--time-chunk-years", type=int, default=None)
     fetch_p.add_argument("--rate-limit", dest="rate_limit_per_sec", type=float, default=None)
+    fetch_p.add_argument("--concurrency", type=int, default=None)
 
     inv_p = sub.add_parser("inventory", help="Inspect an existing zarr store")
     inv_p.add_argument("--store", dest="store_path", default=DEFAULT_CONFIG.store_path)
@@ -51,15 +52,18 @@ def main(argv: list[str] | None = None) -> int:
             batch_size=args.batch_size,
             time_chunk_years=args.time_chunk_years,
             rate_limit_per_sec=args.rate_limit_per_sec,
+            concurrency=args.concurrency,
         )
 
         est = pipeline.estimate_run(config, args.mode)
         print(f"Estimate: {est['n_points']:,} points x {est['n_days']:,} days x "
-              f"{len(config.variables)} variables, over {est['n_requests']:,} requests. "
+              f"{len(config.variables)} variables, over {est['n_requests']:,} requests "
+              f"(concurrency={config.concurrency}). "
               f"Store size ~{pipeline.format_bytes(est['compressed_bytes_low'])}-"
               f"{pipeline.format_bytes(est['compressed_bytes_high'])} compressed "
               f"({pipeline.format_bytes(est['raw_bytes'])} raw). "
-              f"Minimum time (rate-limit pacing alone): {pipeline.format_duration(est['min_seconds'])}.\n")
+              f"Best-case time (pacing floor, unlimited concurrency): "
+              f"{pipeline.format_duration(est['min_seconds'])}.\n")
 
         with tqdm(desc="fetching", unit="batch") as pbar:
             def on_progress(info: pipeline.ProgressInfo) -> None:
@@ -80,6 +84,12 @@ def main(argv: list[str] | None = None) -> int:
         if summary["already_complete"]:
             print(f"\nAlready complete — {summary['n_points']} points, {summary['n_batches']} "
                   "fetch batches were all fetched by a previous run. Nothing to do.")
+        elif summary["stopped"]:
+            reason = summary.get("stop_reason")
+            why = {"rate_limit_day": "Open-Meteo's daily request budget is exhausted (resets in up to 24h).",
+                   "rate_limit_hour": "Open-Meteo's hourly request budget is exhausted."}.get(reason, "Stopped.")
+            print(f"\n{why} {summary['completed_steps']}/{summary['n_batches']} batches done this run. "
+                  "Resumable — run the same command again later to continue.")
         else:
             resumed_note = f" (resumed from batch {summary['resumed_from']})" if summary["resumed_from"] else ""
             print(f"\nDone{resumed_note}. {summary['n_points']} points, {summary['n_batches']} fetch "

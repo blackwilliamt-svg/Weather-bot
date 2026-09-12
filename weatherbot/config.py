@@ -69,13 +69,23 @@ class Config:
 
     # Fetch behavior.
     # Open-Meteo's free/keyless tier rejects large requests outright ("too much
-    # data") and separately caps cumulative data volume per minute. Empirically,
-    # 15 locations x 10 years x 18 variables gets rejected outright while 3 x 10
-    # x 18 succeeds; these defaults (10 locations x 2 years = 20 "location-years")
-    # stay comfortably under that ceiling with margin for the per-minute cap too.
-    batch_size: int = 10  # locations per HTTP request
-    time_chunk_years: int = 2  # years of data fetched per HTTP request, both modes
-    rate_limit_per_sec: float = 0.3  # min seconds between requests = 1/rate_limit_per_sec
+    # data") and separately caps cumulative data volume per minute/hour.
+    # Empirically, 15 locations x 10 years x 18 variables ("location-years" =
+    # locations x years, at fixed 18 vars) gets rejected outright while 3 x 10
+    # succeeds. batch_size x time_chunk_years = 60 location-years here — 2x
+    # the old defaults (20), still well under the known-failing 150 — since
+    # request COUNT (not just per-request volume) is what batching is meant
+    # to cut: for a fixed location-years budget, total requests only depends
+    # on that budget, not on how it's split between locations vs. years.
+    batch_size: int = 20  # locations per HTTP request
+    time_chunk_years: int = 3  # years of data fetched per HTTP request, both modes
+    concurrency: int = 4  # concurrent in-flight requests (bounded worker pool)
+    # rate_limit_per_sec is the FLOOR pace per lane absent any backoff (not a
+    # fixed throttle) — the adaptive limiter in fetch.py starts here and only
+    # slows down in response to actual 429s/errors, speeding back up on a
+    # success streak. See fetch.AdaptiveRateLimiter.
+    rate_limit_per_sec: float = 2.0
+    max_backoff_sec: float = 90.0  # ceiling on the adaptive limiter's backoff
     max_retries: int = 5
     backoff_base_sec: float = 2.0
     request_timeout_sec: float = 60.0

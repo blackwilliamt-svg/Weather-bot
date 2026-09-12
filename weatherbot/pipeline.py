@@ -17,6 +17,7 @@ import datetime as _dt
 import json
 import logging
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -105,8 +106,11 @@ def run_pipeline(
         full_time_index = store.build_time_index(config, end_date)
         store.init_store(config.store_path, points, full_time_index, config)
 
+    # One shared session + rate limiter across every concurrent worker: the
+    # limiter's pacing/backoff state must be shared so that a 429 seen by any
+    # one worker slows down the whole fleet, not just that worker.
     session = fetch.build_session(config)
-    limiter = fetch.RateLimiter(config.rate_limit_per_sec)
+    limiter = fetch.AdaptiveRateLimiter(config)
 
     failures: list[dict] = []
     step = resumed_from
@@ -122,15 +126,8 @@ def run_pipeline(
     flat_steps = [(batch, chunk_start, chunk_end)
                   for batch in point_batches for chunk_start, chunk_end in time_chunks]
 
-    stopped = False
-    for idx, (batch, chunk_start, chunk_end) in enumerate(flat_steps):
-        if idx < resumed_from:
-            continue  # already fetched and written in a previous run
-
-        if should_stop is not None and should_stop():
-            stopped = True
-            break  # leave this and later batches for a future resumed run
-
+    def _process_and_write(idx: int, batch, chunk_start, chunk_end, outcome: fetch.BatchOutcome) -> None:
+        nonlocal step, bytes_downloaded
         point_start = int(batch["point_id"].iloc[0])
         point_stop = int(batch["point_id"].iloc[-1]) + 1
         point_slice = slice(point_start, point_stop)
@@ -139,15 +136,12 @@ def run_pipeline(
         time_offset = store.date_to_offset(chunk_start, config)
         time_slice = slice(time_offset, time_offset + n_days)
 
-        outcome = fetch.fetch_batch(batch, chunk_start, chunk_end, config, session, limiter)
-        results = outcome.results
         bytes_downloaded += outcome.bytes_downloaded
-
         data: dict[str, np.ndarray] = {
             var: np.full((len(batch), n_days), np.nan, dtype=np.float32)
             for var in config.variables
         }
-        for row_idx, result in enumerate(results):
+        for row_idx, result in enumerate(outcome.results):
             if result.error is not None or result.daily is None:
                 failures.append({
                     "point_id": result.point_id,
@@ -196,6 +190,60 @@ def run_pipeline(
             log.info("batch %d/%d done (%s) — %.1f MB downloaded so far",
                       step, total_steps, message, bytes_downloaded / 1e6)
 
+    # Fetches run concurrently (bounded by config.concurrency), but writes
+    # happen strictly in order on this thread — the pool only ever hides
+    # network latency, it never touches the zarr store, so there's no
+    # concurrent-write risk even though several batches' data can be
+    # in flight (and land in the same zarr chunk file) at once.
+    stopped = False
+    stop_reason: Optional[str] = None
+    with ThreadPoolExecutor(max_workers=max(1, config.concurrency)) as executor:
+        pending: dict[int, Future] = {}
+        submit_idx = resumed_from
+
+        def _submit_next() -> None:
+            nonlocal submit_idx
+            if submit_idx < len(flat_steps):
+                b, cs, ce = flat_steps[submit_idx]
+                pending[submit_idx] = executor.submit(fetch.fetch_batch, b, cs, ce, config, session, limiter)
+                submit_idx += 1
+
+        for _ in range(min(max(1, config.concurrency), total_steps - resumed_from)):
+            _submit_next()
+
+        next_write_idx = resumed_from
+        while next_write_idx < total_steps:
+            if should_stop is not None and should_stop():
+                stopped = True
+                stop_reason = "user"
+                break  # in-flight futures are awaited (harmlessly) when the pool exits below
+
+            batch, chunk_start, chunk_end = flat_steps[next_write_idx]
+            outcome = pending.pop(next_write_idx).result()
+
+            if outcome.rate_limited is not None:
+                # An hour/day-scale budget is exhausted: stop the whole run
+                # rather than writing NaN + a permanent failure for this and
+                # every remaining batch. Nothing for this step (or later
+                # ones) is written or checkpointed, so it's fully retried on
+                # the next resumed run, exactly like an unplanned stop.
+                stopped = True
+                stop_reason = f"rate_limit_{outcome.rate_limited}"
+                log.warning("%s rate limit hit at batch %d/%d — stopping, resumable later",
+                            outcome.rate_limited, next_write_idx + 1, total_steps)
+                if on_progress is not None:
+                    limit_name = "daily" if outcome.rate_limited == "day" else "hourly"
+                    on_progress(ProgressInfo(
+                        step, total_steps,
+                        f"{limit_name} rate limit hit — stopping (resumable)",
+                        bytes_downloaded, time.monotonic() - start_time, None,
+                    ))
+                break
+
+            _process_and_write(next_write_idx, batch, chunk_start, chunk_end, outcome)
+            next_write_idx += 1
+            _submit_next()
+
     store.finalize_store(config.store_path)
     # Deliberately not cleared: keeping the manifest (now at completed_steps
     # == total_steps) makes a finished run idempotent — rerunning with the
@@ -208,6 +256,7 @@ def run_pipeline(
         "resumed_from": resumed_from,
         "already_complete": resumed_from >= total_steps,
         "stopped": stopped,
+        "stop_reason": stop_reason,
         "bytes_downloaded": bytes_downloaded,
         "elapsed_sec": time.monotonic() - start_time,
         "failures": failures,
@@ -290,9 +339,13 @@ def estimate_run(config: Config, mode: str) -> dict:
     n_requests = n_point_batches * n_time_chunks
 
     raw_bytes = n_points * n_days * n_vars * 4
-    # Lower-bound time estimate from rate-limit pacing alone (ignores retries,
-    # 429 backoffs, and the network round-trip itself, so actual time will be
-    # somewhat higher).
+    # Absolute floor from the shared rate-limit pacing alone (dispatches are
+    # globally spaced >= 1/rate_limit_per_sec apart no matter how many
+    # workers are concurrent — see fetch.AdaptiveRateLimiter). Concurrency
+    # can approach this floor by overlapping response latency across
+    # workers, but can't beat it, and how CLOSE it gets depends on the real
+    # per-request latency, which this can't predict without a live
+    # measurement — treat this as a best case, not the expected time.
     min_seconds = n_requests / config.rate_limit_per_sec if config.rate_limit_per_sec > 0 else None
     return {
         "n_points": n_points,

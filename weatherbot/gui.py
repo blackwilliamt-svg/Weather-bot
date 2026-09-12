@@ -198,16 +198,24 @@ class WeatherBotApp:
         elapsed = pipeline.format_duration(summary["elapsed_sec"])
 
         if summary["stopped"]:
+            reason = summary.get("stop_reason")
+            if reason == "rate_limit_day":
+                why = ("Open-Meteo's daily request budget is used up — this will need to wait "
+                       "until it resets (up to 24h) before continuing.")
+            elif reason == "rate_limit_hour":
+                why = "Open-Meteo's hourly request budget is used up — try again in a while."
+            else:
+                why = "Stopped by request."
             self._append_log(
-                f"--- Stopped: {summary['completed_steps']}/{summary['n_batches']} files done, "
-                f"{downloaded} downloaded this session in {elapsed}. Resumable — click the same "
-                "run button again to continue from here. ---"
+                f"--- Stopped ({why}): {summary['completed_steps']}/{summary['n_batches']} files "
+                f"done, {downloaded} downloaded this session in {elapsed}. Resumable — click the "
+                "same run button again to continue from here. ---"
             )
             self.stats_var.set(f"Stopped: {summary['completed_steps']}/{summary['n_batches']} files")
             messagebox.showinfo(
                 "WeatherBot",
-                f"Stopped.\n{summary['completed_steps']} of {summary['n_batches']} files fetched "
-                f"before stopping.\nStore: {payload['store_path']}\n\n"
+                f"Stopped.\n{why}\n\n{summary['completed_steps']} of {summary['n_batches']} files "
+                f"fetched before stopping.\nStore: {payload['store_path']}\n\n"
                 "This is resumable — run the same pull again to continue where it left off.",
             )
             return

@@ -10,6 +10,7 @@ from __future__ import annotations
 import datetime as _dt
 import logging
 import random
+import threading
 import time
 from dataclasses import dataclass
 
@@ -20,10 +21,17 @@ from .config import Config
 
 log = logging.getLogger(__name__)
 
-# Open-Meteo's free/keyless tier returns this when the per-minute data-volume
-# budget is exceeded — its own message says to wait about a minute, so retries
-# on this status use a floor well above ordinary exponential backoff.
-_RATE_LIMIT_MIN_WAIT_SEC = 60.0
+# Open-Meteo's free/keyless tier returns a 429 for three different reasons
+# with very different recovery times: a "Minutely" message clears in about a
+# minute (ordinary adaptive backoff, capped by config.max_backoff_sec, is
+# enough — fine to retry in-process). "Hourly" and "Daily" mean a much bigger
+# budget is spent — recovering takes 15+ minutes to a full day, far too long
+# to block a worker thread inside a retry loop for. Those are NOT retried
+# in-process at all: fetch_batch returns immediately with rate_limited set,
+# and the pipeline stops the whole run (leaving the batch unwritten, so a
+# later resume retries it) instead of sleeping a thread or — worse —
+# recording it as a permanent per-point failure.
+_MINUTE_LIMIT_MIN_WAIT_SEC = 60.0
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
 
@@ -40,25 +48,64 @@ class FetchResult:
 class BatchOutcome:
     results: list[FetchResult]
     bytes_downloaded: int  # total response bytes across all attempts (incl. retries)
+    rate_limited: str | None = None  # None | "hour" | "day" — see module docstring above
 
 
 def build_session(config: Config) -> requests.Session:
     return requests.Session()
 
 
-class RateLimiter:
-    def __init__(self, per_sec: float):
-        self._min_interval = 1.0 / per_sec if per_sec > 0 else 0.0
-        self._last_call = 0.0
+class AdaptiveRateLimiter:
+    """Thread-safe pacing shared across all concurrent workers.
+
+    Starts at config.rate_limit_per_sec (a floor, not a fixed throttle) and
+    only slows down in response to actual 429s/errors — via on_success()
+    (gradually speeds back up toward the floor after a clean streak) and
+    on_rate_limited()/on_hourly_limit() (backs off, capped at
+    config.max_backoff_sec for ordinary cases; the hourly case gets its own
+    long fixed cooldown instead, applied globally so every worker pauses,
+    not just the one that got the 429).
+    """
+
+    def __init__(self, config: Config):
+        self._min_interval = 1.0 / config.rate_limit_per_sec if config.rate_limit_per_sec > 0 else 0.0
+        self._max_interval = config.max_backoff_sec
+        self._current_interval = self._min_interval
+        self._next_allowed = 0.0
+        self._success_streak = 0
+        self._lock = threading.Lock()
 
     def wait(self) -> None:
-        if self._min_interval <= 0:
-            return
-        elapsed = time.monotonic() - self._last_call
-        remaining = self._min_interval - elapsed
-        if remaining > 0:
-            time.sleep(remaining)
-        self._last_call = time.monotonic()
+        with self._lock:
+            now = time.monotonic()
+            dispatch_at = max(now, self._next_allowed)
+            self._next_allowed = dispatch_at + self._current_interval
+        sleep_for = dispatch_at - now
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+
+    def on_success(self) -> None:
+        with self._lock:
+            self._success_streak += 1
+            # Every few clean requests, ease back toward the floor pace.
+            if self._success_streak >= 3 and self._current_interval > self._min_interval:
+                self._current_interval = max(self._min_interval, self._current_interval * 0.7)
+                self._success_streak = 0
+
+    def on_rate_limited(self) -> None:
+        with self._lock:
+            self._success_streak = 0
+            self._current_interval = min(self._max_interval, max(self._current_interval * 2, 1.0))
+            self._next_allowed = max(self._next_allowed, time.monotonic() + _MINUTE_LIMIT_MIN_WAIT_SEC)
+
+    def on_long_cooldown(self, seconds: float) -> None:
+        """For hour/day-scale limits — sets a global pause, but callers must
+        NOT block a worker thread waiting it out (see fetch_batch); this only
+        affects the pace of whatever gets dispatched next, after the caller
+        has already decided to stop and resume later."""
+        with self._lock:
+            self._success_streak = 0
+            self._next_allowed = max(self._next_allowed, time.monotonic() + seconds)
 
 
 def fetch_batch(
@@ -67,7 +114,7 @@ def fetch_batch(
     end_date: _dt.date,
     config: Config,
     session: requests.Session,
-    limiter: RateLimiter,
+    limiter: AdaptiveRateLimiter,
 ) -> BatchOutcome:
     """Fetch one batch of points (a small DataFrame with point_id/lat/lon) for
     one shared date range. Returns one FetchResult per input point, in order,
@@ -108,15 +155,37 @@ def fetch_batch(
 
         bytes_downloaded += len(resp.content)
         if resp.status_code == 200:
+            limiter.on_success()
             break
 
         last_reason = f"HTTP {resp.status_code}: {resp.text[:200]}"
+
+        if resp.status_code == 429:
+            reason_text = resp.text.lower()
+            if "daily" in reason_text or "hourly" in reason_text:
+                # Hour/day-scale budget exhausted: don't retry in-process —
+                # that would block this thread for 15+ min to a full day.
+                # Return immediately so the pipeline can stop the whole run
+                # cleanly and resume it later instead.
+                severity = "day" if "daily" in reason_text else "hour"
+                cooldown = 86400.0 if severity == "day" else 900.0
+                limiter.on_long_cooldown(cooldown)
+                log.warning("%s rate limit hit — stopping this run, resumable later: %s",
+                            severity, last_reason)
+                results = [
+                    FetchResult(int(r.point_id), float(r.lat), float(r.lon), None, last_reason)
+                    for r in points.itertuples()
+                ]
+                return BatchOutcome(results, bytes_downloaded, rate_limited=severity)
+
         if resp.status_code not in _RETRYABLE_STATUS or attempt == config.max_retries:
             break  # not retryable (e.g. 400 "too much data") or out of attempts
 
-        sleep_s = config.backoff_base_sec * (2 ** attempt) + random.uniform(0, 1)
         if resp.status_code == 429:
-            sleep_s = max(sleep_s, _RATE_LIMIT_MIN_WAIT_SEC)
+            limiter.on_rate_limited()
+            sleep_s = _MINUTE_LIMIT_MIN_WAIT_SEC
+        else:
+            sleep_s = config.backoff_base_sec * (2 ** attempt) + random.uniform(0, 1)
         log.warning("HTTP %d fetching batch (attempt %d/%d) — retrying in %.1fs: %s",
                     resp.status_code, attempt + 1, config.max_retries + 1, sleep_s, last_reason)
         time.sleep(sleep_s)

@@ -25,13 +25,11 @@ Double-click **`WeatherBot.bat`**. A window opens with four buttons:
   couple of minutes; use this to confirm everything works before committing
   to the full pull. Writes to `data/weather_test.zarr`.
 - **Run Full Pull** — the real archive: ~19,000-26,000 land grid points across
-  North America, 1940-present, roughly 18-27GB compressed. At the default
-  rate limit this is well over 100,000 individual requests — the app shows an
-  exact estimate (points/days/requests/size/minimum time) before you confirm,
-  and it will likely be **days**, not hours, unless you raise `--rate-limit`
-  (which risks more 429s — see "Command line" below). Leave the computer on
-  and connected to the internet while it runs. Writes to
-  `data/weather_archive.zarr`.
+  North America, 1940-present, roughly 18-27GB compressed. The app shows an
+  exact estimate (points/days/requests/size/best-case time) before you
+  confirm — see "Fetch performance" below for what actually governs how long
+  it takes. Leave the computer on and connected to the internet while it
+  runs. Writes to `data/weather_archive.zarr`.
 - **Show Inventory** — pick any `.zarr` folder under `data/` and see what's in
   it so far: point count, date range, variables, and size on disk — without
   loading the actual weather data into memory.
@@ -60,23 +58,71 @@ tuning knobs the GUI doesn't expose:
 .venv\Scripts\python.exe -m weatherbot inventory --store data/weather_archive.zarr --list-points
 ```
 
-Grid density, chunking, batching, and rate limiting are all configurable
-rather than hardcoded:
+Grid density, chunking, batching, rate limiting, and concurrency are all
+configurable rather than hardcoded:
 
 ```bash
 .venv\Scripts\python.exe -m weatherbot fetch --mode full --spacing-deg 0.15 \
     --point-chunk 50 --time-chunk-days 365 --zstd-level 12 \
-    --batch-size 10 --time-chunk-years 2 --rate-limit 0.3
+    --batch-size 20 --time-chunk-years 3 --rate-limit 2.0 --concurrency 4
 ```
 
+## Fetch performance
+
 Open-Meteo's free/keyless tier rejects requests that ask for too much data at
-once (many locations x many years x many variables in one call) and separately
-caps total data volume per minute/hour. `--batch-size` (locations per HTTP
-request) and `--time-chunk-years` (years fetched per request) control how the
-pipeline splits work to stay under that; the defaults were tuned empirically
-against the live API and include retry/backoff for occasional 429s, but if
-you still see frequent rate-limit failures, lower those further or reduce
-`--rate-limit`.
+once (many locations x many years x many variables in one call) and
+separately caps total data volume per minute/hour — a 429 response says
+which. Three things work together to fetch as fast as that allows without
+tripping either limit harder than necessary:
+
+- **Batching** (`--batch-size` locations x `--time-chunk-years` per request):
+  for a fixed per-request data budget, request COUNT only depends on that
+  budget (locations x years), not how it's split between the two — so this is
+  really one knob, "location-years per request". Empirically, 15 locations x
+  10 years (150 location-years) gets rejected outright while 3 x 10 (30)
+  succeeds; the defaults (20 x 3 = 60) sit with margin on both sides of that,
+  found by testing against the live API, not guessed.
+- **Concurrency** (`--concurrency`, default 4): several batches fetch at once
+  on a bounded worker pool. This helps because response latency — waiting
+  for Open-Meteo to build and return a big multi-location, multi-year
+  response — dominates over pure request-count pacing; overlapping that wait
+  across workers is a real, measured wall-clock speedup (not just fewer
+  requests). Writes to the zarr store still happen one at a time, strictly in
+  fetch order, on the main thread — only the network wait is parallelized, so
+  there's no risk of concurrent writes corrupting a store even when several
+  batches land in the same chunk file.
+- **Adaptive rate limiting** (`--rate-limit`, a floor in requests/sec, not a
+  fixed delay): starts fast and only backs off in response to an actual 429,
+  shared across every concurrent worker (so one worker's 429 slows down the
+  whole pool, not just itself), then eases back toward the floor after a
+  clean streak. A "your minute budget is exhausted" 429 backs off for about a
+  minute; an "hourly" one gets a much longer fixed cooldown instead, since no
+  amount of short backoff growth would clear that sensibly.
+
+None of this can exceed whatever Open-Meteo's servers actually allow — if the
+constraint turns out to be a hard data-volume budget rather than a request-
+count one, batching and concurrency mostly save the wasted idle time from
+being more conservative than necessary, rather than multiplying the true
+ceiling. The app's upfront estimate before a full pull shows the theoretical
+best case (pacing floor with unlimited concurrency); the real observed rate
+during a run is what its live ETA is based on, and is the trustworthy number.
+
+There's also a **daily** budget on top of the per-minute/hour ones — a 429
+whose message says "Daily API request limit exceeded" means the whole day's
+allowance is spent, not just this run's. Like the hourly case, this doesn't
+retry in a loop; the run stops cleanly and is fully resumable once the
+budget resets, rather than sitting there or (worse) recording every
+remaining batch as a permanent failure.
+
+**On the numbers below**: batching alone cuts full-pull request count from
+~111,000 to ~37,000 (verified by direct calculation from the new defaults),
+and a controlled test with simulated network latency measured a real 3.3x
+wall-clock speedup from concurrency=4 (see the pipeline test in this repo's
+history). The actual full-pull completion time versus the live API has not
+been re-measured after these changes — testing them exhausted the day's
+request budget, so a genuine end-to-end timing run is pending until it
+resets. Treat the app's live ETA during your own first run as the real
+number, not this estimate.
 
 ## Geographic coverage
 
