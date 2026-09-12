@@ -4,8 +4,8 @@ Two entry points: run_test_mode() and run_full_mode(). Both share the same
 batch loop; they differ only in point-set size and time range/chunking.
 
 This module has no console/GUI output of its own — run_pipeline() reports
-progress through an optional on_progress(step, total, message) callback
-instead of printing, and failure reporting is exposed as pure helpers
+progress through an optional on_progress(ProgressInfo) callback instead of
+printing, and failure reporting is exposed as pure helpers
 (format_failure_summary, write_failure_log) so both the CLI and the GUI can
 format/display results their own way. This also matters for the GUI
 specifically: it runs under pythonw.exe, where sys.stdout/stderr are None, so
@@ -16,6 +16,8 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import logging
+import time
+from dataclasses import dataclass
 from typing import Callable, Optional
 
 import numpy as np
@@ -26,7 +28,18 @@ from .config import Config, TEST_MODE_POINTS, TEST_MODE_YEARS
 
 log = logging.getLogger(__name__)
 
-ProgressCallback = Callable[[int, int, str], None]
+
+@dataclass
+class ProgressInfo:
+    step: int
+    total_steps: int
+    message: str
+    bytes_downloaded: int  # cumulative, across the whole run so far
+    elapsed_sec: float
+    eta_sec: Optional[float]  # None until at least one step has completed
+
+
+ProgressCallback = Callable[[ProgressInfo], None]
 
 
 def _daily_row(daily: dict, variable: str, expected_len: int) -> np.ndarray | None:
@@ -60,9 +73,9 @@ def run_pipeline(
 ) -> dict:
     """Runs the full batch loop for a given point set and date range.
 
-    on_progress(step, total_steps, message), if given, is called after each
-    fetched+written batch. Returns a summary dict:
-    {n_points, n_batches, failures: [...]}.
+    on_progress(ProgressInfo), if given, is called after each fetched+written
+    batch. Returns a summary dict:
+    {n_points, n_batches, bytes_downloaded, elapsed_sec, failures: [...]}.
     """
     full_time_index = store.build_time_index(config, end_date)
     store.init_store(config.store_path, points, full_time_index, config)
@@ -75,6 +88,8 @@ def run_pipeline(
     time_chunks = list(_iter_time_chunks(start_date, end_date, years_per_time_chunk))
     total_steps = len(point_batches) * len(time_chunks)
     step = 0
+    bytes_downloaded = 0
+    start_time = time.monotonic()
 
     for batch in point_batches:
         point_start = int(batch["point_id"].iloc[0])
@@ -86,7 +101,9 @@ def run_pipeline(
             time_offset = store.date_to_offset(chunk_start, config)
             time_slice = slice(time_offset, time_offset + n_days)
 
-            results = fetch.fetch_batch(batch, chunk_start, chunk_end, config, session, limiter)
+            outcome = fetch.fetch_batch(batch, chunk_start, chunk_end, config, session, limiter)
+            results = outcome.results
+            bytes_downloaded += outcome.bytes_downloaded
 
             data: dict[str, np.ndarray] = {
                 var: np.full((len(batch), n_days), np.nan, dtype=np.float32)
@@ -126,19 +143,48 @@ def run_pipeline(
 
             store.write_region(config.store_path, data, point_slice, time_slice)
             step += 1
+            elapsed_sec = time.monotonic() - start_time
+            eta_sec = (elapsed_sec / step) * (total_steps - step) if step > 0 else None
+            message = (f"points {point_slice.start}-{point_slice.stop - 1}, "
+                       f"{chunk_start.isoformat()}..{chunk_end.isoformat()}")
             if on_progress is not None:
-                on_progress(
-                    step, total_steps,
-                    f"points {point_slice.start}-{point_slice.stop - 1}, "
-                    f"{chunk_start.isoformat()}..{chunk_end.isoformat()}",
-                )
+                on_progress(ProgressInfo(step, total_steps, message, bytes_downloaded, elapsed_sec, eta_sec))
             else:
-                log.info("batch %d/%d done (points %d-%d, %s..%s)",
-                          step, total_steps, point_slice.start, point_slice.stop - 1,
-                          chunk_start.isoformat(), chunk_end.isoformat())
+                log.info("batch %d/%d done (%s) — %.1f MB downloaded so far",
+                          step, total_steps, message, bytes_downloaded / 1e6)
 
     store.finalize_store(config.store_path)
-    return {"n_points": len(points), "n_batches": total_steps, "failures": failures}
+    return {
+        "n_points": len(points),
+        "n_batches": total_steps,
+        "bytes_downloaded": bytes_downloaded,
+        "elapsed_sec": time.monotonic() - start_time,
+        "failures": failures,
+    }
+
+
+def format_bytes(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.2f} {unit}"
+        n /= 1024
+    return f"{n:.2f} TB"
+
+
+def format_duration(seconds: Optional[float]) -> str:
+    if seconds is None:
+        return "estimating..."
+    seconds = max(0, int(seconds))
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours}h {minutes}m"
+    if hours:
+        return f"{hours}h {minutes}m {secs}s"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
 
 
 def format_failure_summary(summary: dict) -> str:
@@ -169,6 +215,43 @@ def write_failure_log(summary: dict, store_path: str) -> Optional[str]:
     with open(log_path, "w") as fh:
         json.dump(failures, fh, indent=2)
     return log_path
+
+
+def estimate_run(config: Config, mode: str) -> dict:
+    """Cheap, no-network estimate of a run's size/shape, for display before
+    starting: point/day/variable counts, number of HTTP requests, and a rough
+    compressed-store size range (float32 raw size / an assumed 2-3x zstd
+    compression ratio typical for daily weather data)."""
+    if mode == "test":
+        points = grid.generate_test_grid(config, TEST_MODE_POINTS)
+        end_date = config.end_date()
+        start_date = (pd.Timestamp(end_date) - pd.DateOffset(years=TEST_MODE_YEARS)).date()
+    else:
+        points = grid.generate_full_grid(config)
+        start_date = config.archive_start_date
+        end_date = config.end_date()
+
+    n_points = len(points)
+    n_days = (pd.Timestamp(end_date) - pd.Timestamp(start_date)).days + 1
+    n_vars = len(config.variables)
+    n_point_batches = -(-n_points // config.batch_size)  # ceil div
+    n_time_chunks = len(list(_iter_time_chunks(start_date, end_date, config.time_chunk_years)))
+    n_requests = n_point_batches * n_time_chunks
+
+    raw_bytes = n_points * n_days * n_vars * 4
+    # Lower-bound time estimate from rate-limit pacing alone (ignores retries,
+    # 429 backoffs, and the network round-trip itself, so actual time will be
+    # somewhat higher).
+    min_seconds = n_requests / config.rate_limit_per_sec if config.rate_limit_per_sec > 0 else None
+    return {
+        "n_points": n_points,
+        "n_days": n_days,
+        "n_requests": n_requests,
+        "raw_bytes": raw_bytes,
+        "compressed_bytes_low": raw_bytes / 3,
+        "compressed_bytes_high": raw_bytes / 2,
+        "min_seconds": min_seconds,
+    }
 
 
 def run_test_mode(config: Config, on_progress: Optional[ProgressCallback] = None) -> dict:

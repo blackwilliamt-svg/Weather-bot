@@ -53,12 +53,23 @@ def main(argv: list[str] | None = None) -> int:
             rate_limit_per_sec=args.rate_limit_per_sec,
         )
 
+        est = pipeline.estimate_run(config, args.mode)
+        print(f"Estimate: {est['n_points']:,} points x {est['n_days']:,} days x "
+              f"{len(config.variables)} variables, over {est['n_requests']:,} requests. "
+              f"Store size ~{pipeline.format_bytes(est['compressed_bytes_low'])}-"
+              f"{pipeline.format_bytes(est['compressed_bytes_high'])} compressed "
+              f"({pipeline.format_bytes(est['raw_bytes'])} raw). "
+              f"Minimum time (rate-limit pacing alone): {pipeline.format_duration(est['min_seconds'])}.\n")
+
         with tqdm(desc="fetching", unit="batch") as pbar:
-            def on_progress(step: int, total: int, message: str) -> None:
-                if pbar.total != total:
-                    pbar.total = total
-                pbar.n = step
-                pbar.set_postfix_str(message)
+            def on_progress(info: pipeline.ProgressInfo) -> None:
+                if pbar.total != info.total_steps:
+                    pbar.total = info.total_steps
+                pbar.n = info.step
+                pbar.set_postfix_str(
+                    f"{pipeline.format_bytes(info.bytes_downloaded)} downloaded, "
+                    f"ETA {pipeline.format_duration(info.eta_sec)} | {info.message}"
+                )
                 pbar.refresh()
 
             if args.mode == "test":
@@ -68,6 +79,8 @@ def main(argv: list[str] | None = None) -> int:
 
         print(f"\nDone. {summary['n_points']} points, {summary['n_batches']} fetch batches, "
               f"{len(summary['failures'])} failed attempts.")
+        print(f"Downloaded {pipeline.format_bytes(summary['bytes_downloaded'])} "
+              f"in {pipeline.format_duration(summary['elapsed_sec'])}.")
         print(pipeline.format_failure_summary(summary))
         log_path = pipeline.write_failure_log(summary, config.store_path)
         if log_path:

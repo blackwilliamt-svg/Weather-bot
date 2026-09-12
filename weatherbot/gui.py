@@ -27,14 +27,6 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 from . import inventory, pipeline
 from .config import DEFAULT_CONFIG, DEFAULT_FULL_STORE_PATH, DEFAULT_TEST_STORE_PATH
 
-FULL_PULL_WARNING = (
-    "This will fetch data for roughly 19,000-26,000 land grid points across "
-    "North America, from 1940 to present.\n\n"
-    "It can take several hours and download tens of gigabytes. Run this on a "
-    "machine you can leave on for a while.\n\n"
-    "Continue?"
-)
-
 
 class WeatherBotApp:
     def __init__(self, root: tk.Tk):
@@ -66,6 +58,9 @@ class WeatherBotApp:
         self.progress = ttk.Progressbar(progress_frame, mode="determinate")
         self.progress.pack(fill="x")
 
+        self.stats_var = tk.StringVar(value="")
+        ttk.Label(progress_frame, textvariable=self.stats_var).pack(anchor="w", pady=(4, 0))
+
         log_frame = ttk.Frame(self.root, padding=10)
         log_frame.pack(fill="both", expand=True)
         self.log_widget = scrolledtext.ScrolledText(log_frame, state="disabled", wrap="word")
@@ -90,10 +85,16 @@ class WeatherBotApp:
                 if kind == "log":
                     self._append_log(str(payload))
                 elif kind == "progress":
-                    step, total = payload
-                    self.progress["maximum"] = max(total, 1)
-                    self.progress["value"] = step
-                    self.status_var.set(f"Running... {step}/{total}")
+                    info: pipeline.ProgressInfo = payload
+                    self.progress["maximum"] = max(info.total_steps, 1)
+                    self.progress["value"] = info.step
+                    self.status_var.set(f"Running... {info.step}/{info.total_steps}")
+                    self.stats_var.set(
+                        f"File {info.step} of {info.total_steps}  |  "
+                        f"Downloaded: {pipeline.format_bytes(info.bytes_downloaded)}  |  "
+                        f"Elapsed: {pipeline.format_duration(info.elapsed_sec)}  |  "
+                        f"ETA: {pipeline.format_duration(info.eta_sec)}"
+                    )
                 elif kind == "done":
                     self._on_run_finished(payload)
                 elif kind == "error":
@@ -107,12 +108,33 @@ class WeatherBotApp:
 
     # --- run pulls -----------------------------------------------------
 
+    def _estimate_text(self, mode: str) -> str:
+        est = pipeline.estimate_run(DEFAULT_CONFIG, mode)
+        return (
+            f"{est['n_points']:,} grid points x {est['n_days']:,} days "
+            f"x {len(DEFAULT_CONFIG.variables)} variables, over {est['n_requests']:,} requests.\n"
+            f"Estimated store size: {pipeline.format_bytes(est['compressed_bytes_low'])}"
+            f" - {pipeline.format_bytes(est['compressed_bytes_high'])} compressed "
+            f"({pipeline.format_bytes(est['raw_bytes'])} raw).\n"
+            f"Minimum time (rate-limit pacing alone, no retries): "
+            f"{pipeline.format_duration(est['min_seconds'])}."
+        )
+
     def run_test(self) -> None:
+        self._append_log(f"Test pull estimate: {self._estimate_text('test')}")
         self._start_run(mode="test")
 
     def run_full(self) -> None:
-        if not messagebox.askyesno("Run full pull?", FULL_PULL_WARNING):
+        estimate = self._estimate_text("full")
+        warning = (
+            f"This will fetch:\n\n{estimate}\n\n"
+            "This can take a long time (potentially days) at the default "
+            "rate limit. Run this on a machine you can leave on and "
+            "connected to the internet for a while.\n\nContinue?"
+        )
+        if not messagebox.askyesno("Run full pull?", warning):
             return
+        self._append_log(f"Full pull estimate: {estimate}")
         self._start_run(mode="full")
 
     def _start_run(self, mode: str) -> None:
@@ -130,9 +152,13 @@ class WeatherBotApp:
             store_path = DEFAULT_TEST_STORE_PATH if mode == "test" else DEFAULT_FULL_STORE_PATH
             config = DEFAULT_CONFIG.with_overrides(store_path=store_path)
 
-            def on_progress(step: int, total: int, message: str) -> None:
-                self.msg_queue.put(("progress", (step, total)))
-                self.msg_queue.put(("log", f"[{step}/{total}] {message}"))
+            def on_progress(info: pipeline.ProgressInfo) -> None:
+                self.msg_queue.put(("progress", info))
+                self.msg_queue.put(("log",
+                    f"[{info.step}/{info.total_steps}] {info.message}  "
+                    f"({pipeline.format_bytes(info.bytes_downloaded)} total, "
+                    f"ETA {pipeline.format_duration(info.eta_sec)})"
+                ))
 
             if mode == "test":
                 summary = pipeline.run_test_mode(config, on_progress=on_progress)
@@ -153,13 +179,20 @@ class WeatherBotApp:
         self._set_buttons_enabled(True)
         self.status_var.set("Idle")
         summary = payload["summary"]
-        self._append_log(f"--- Done: {summary['n_points']} points, {summary['n_batches']} batches ---")
+        downloaded = pipeline.format_bytes(summary["bytes_downloaded"])
+        elapsed = pipeline.format_duration(summary["elapsed_sec"])
+        self._append_log(
+            f"--- Done: {summary['n_points']} points, {summary['n_batches']} files fetched, "
+            f"{downloaded} downloaded in {elapsed} ---"
+        )
         self._append_log(payload["failure_text"])
         if payload["log_path"]:
             self._append_log(f"Full failure list written to: {payload['log_path']}")
+        self.stats_var.set(f"Finished: {summary['n_batches']} files, {downloaded}, {elapsed}")
         messagebox.showinfo(
             "WeatherBot",
-            f"Finished.\n{summary['n_points']} points, {summary['n_batches']} batches fetched.\n"
+            f"Finished.\n{summary['n_points']} points, {summary['n_batches']} files fetched.\n"
+            f"Downloaded {downloaded} in {elapsed}.\n"
             f"Store: {payload['store_path']}\n\n{payload['failure_text'].splitlines()[0]}",
         )
 

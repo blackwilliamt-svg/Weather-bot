@@ -36,6 +36,12 @@ class FetchResult:
     error: str | None = None
 
 
+@dataclass
+class BatchOutcome:
+    results: list[FetchResult]
+    bytes_downloaded: int  # total response bytes across all attempts (incl. retries)
+
+
 def build_session(config: Config) -> requests.Session:
     return requests.Session()
 
@@ -62,9 +68,10 @@ def fetch_batch(
     config: Config,
     session: requests.Session,
     limiter: RateLimiter,
-) -> list[FetchResult]:
+) -> BatchOutcome:
     """Fetch one batch of points (a small DataFrame with point_id/lat/lon) for
-    one shared date range. Returns one FetchResult per input point, in order.
+    one shared date range. Returns one FetchResult per input point, in order,
+    plus the total response bytes downloaded (including retried attempts).
     Never raises: a batch-level failure marks every point in it failed; a
     per-location error inside a 200 response marks just that point failed.
     """
@@ -81,6 +88,7 @@ def fetch_batch(
 
     last_reason: str | None = None
     resp: requests.Response | None = None
+    bytes_downloaded = 0
     for attempt in range(config.max_retries + 1):
         limiter.wait()
         try:
@@ -98,6 +106,7 @@ def fetch_batch(
             time.sleep(sleep_s)
             continue
 
+        bytes_downloaded += len(resp.content)
         if resp.status_code == 200:
             break
 
@@ -114,24 +123,26 @@ def fetch_batch(
 
     if resp is None or resp.status_code != 200:
         reason = last_reason or "unknown fetch failure"
-        return [
+        results = [
             FetchResult(int(r.point_id), float(r.lat), float(r.lon), None, reason)
             for r in points.itertuples()
         ]
+        return BatchOutcome(results, bytes_downloaded)
 
     try:
         payload = resp.json()
     except ValueError as exc:
         reason = f"invalid JSON response: {exc}"
-        return [
+        results = [
             FetchResult(int(r.point_id), float(r.lat), float(r.lon), None, reason)
             for r in points.itertuples()
         ]
+        return BatchOutcome(results, bytes_downloaded)
 
     # Single location -> plain object; multiple -> list of objects (same order as input).
     records = payload if isinstance(payload, list) else [payload]
 
-    results: list[FetchResult] = []
+    results = []
     for row, record in zip(points.itertuples(), records):
         if not isinstance(record, dict) or record.get("error"):
             reason = record.get("reason", "unknown error") if isinstance(record, dict) else "malformed response"
@@ -142,4 +153,4 @@ def fetch_batch(
             results.append(FetchResult(int(row.point_id), float(row.lat), float(row.lon), None, "no 'daily' block in response"))
             continue
         results.append(FetchResult(int(row.point_id), float(row.lat), float(row.lon), daily, None))
-    return results
+    return BatchOutcome(results, bytes_downloaded)

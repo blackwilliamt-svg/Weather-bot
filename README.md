@@ -25,16 +25,20 @@ Double-click **`WeatherBot.bat`**. A window opens with three buttons:
   couple of minutes; use this to confirm everything works before committing
   to the full pull. Writes to `data/weather_test.zarr`.
 - **Run Full Pull** — the real archive: ~19,000-26,000 land grid points across
-  North America, 1940-present. This is a multi-hour run that downloads tens of
-  gigabytes — the app asks you to confirm before starting. Leave the computer
-  on and connected to the internet while it runs. Writes to
+  North America, 1940-present, roughly 18-27GB compressed. At the default
+  rate limit this is well over 100,000 individual requests — the app shows an
+  exact estimate (points/days/requests/size/minimum time) before you confirm,
+  and it will likely be **days**, not hours, unless you raise `--rate-limit`
+  (which risks more 429s — see "Command line" below). Leave the computer on
+  and connected to the internet while it runs. Writes to
   `data/weather_archive.zarr`.
 - **Show Inventory** — pick any `.zarr` folder under `data/` and see what's in
   it so far: point count, date range, variables, and size on disk — without
   loading the actual weather data into memory.
 
-The window shows a progress bar and a running log while a pull is in
-progress, and both buttons stay disabled until it finishes so you can't start
+The window shows a progress bar, a running log, and live stats (files
+fetched, data downloaded, elapsed/estimated time remaining) while a pull is
+in progress, and both buttons stay disabled until it finishes so you can't start
 two runs at once. If any grid points fail to fetch (network error, bad
 response, etc.), that's not fatal — they're skipped, and a summary shows up in
 the log and in a popup when the run finishes, with the full list saved next to
