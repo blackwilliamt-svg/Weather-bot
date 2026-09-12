@@ -77,10 +77,15 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 summary = pipeline.run_full_mode(config, on_progress=on_progress)
 
-        print(f"\nDone. {summary['n_points']} points, {summary['n_batches']} fetch batches, "
-              f"{len(summary['failures'])} failed attempts.")
-        print(f"Downloaded {pipeline.format_bytes(summary['bytes_downloaded'])} "
-              f"in {pipeline.format_duration(summary['elapsed_sec'])}.")
+        if summary["already_complete"]:
+            print(f"\nAlready complete — {summary['n_points']} points, {summary['n_batches']} "
+                  "fetch batches were all fetched by a previous run. Nothing to do.")
+        else:
+            resumed_note = f" (resumed from batch {summary['resumed_from']})" if summary["resumed_from"] else ""
+            print(f"\nDone{resumed_note}. {summary['n_points']} points, {summary['n_batches']} fetch "
+                  f"batches total, {len(summary['failures'])} failed attempts.")
+            print(f"Downloaded {pipeline.format_bytes(summary['bytes_downloaded'])} this session "
+                  f"in {pipeline.format_duration(summary['elapsed_sec'])}.")
         print(pipeline.format_failure_summary(summary))
         log_path = pipeline.write_failure_log(summary, config.store_path)
         if log_path:

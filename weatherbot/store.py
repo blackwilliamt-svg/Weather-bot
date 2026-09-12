@@ -9,7 +9,10 @@ finalize_store() consolidates metadata once at the end.
 from __future__ import annotations
 
 import datetime as _dt
+import hashlib
+import json
 import os
+from typing import Optional
 
 import dask.array as da
 import numcodecs
@@ -98,3 +101,82 @@ def write_region(
 
 def finalize_store(store_path: str) -> None:
     zarr.consolidate_metadata(store_path)
+
+
+# --- resume support ------------------------------------------------------
+#
+# A run can take days, so it needs to survive being interrupted (reboot,
+# sleep, closed by accident, power loss) and resumed later without
+# re-fetching everything or corrupting the store. The manifest records the
+# exact parameters a run committed to (including the resolved start/end
+# date — full-pull's end_date is normally "today minus a lag", which drifts
+# day to day, so a resumed run must reuse the ORIGINAL end_date rather than
+# recomputing a new one) plus how many batches are already written. If any
+# of the shape-relevant parameters differ from a fresh request, the
+# manifest is treated as stale and a normal fresh run happens instead.
+
+def _manifest_path(store_path: str) -> str:
+    return f"{store_path}.progress.json"
+
+
+def grid_fingerprint(points: pd.DataFrame) -> str:
+    h = hashlib.sha256()
+    h.update(points["point_id"].to_numpy(dtype=np.int64).tobytes())
+    h.update(points["lat"].to_numpy(dtype=np.float64).tobytes())
+    h.update(points["lon"].to_numpy(dtype=np.float64).tobytes())
+    return h.hexdigest()
+
+
+def read_manifest(store_path: str) -> Optional[dict]:
+    """Returns the resume manifest if the store directory and manifest file
+    both exist and parse cleanly, else None."""
+    if not os.path.isdir(store_path):
+        return None
+    path = _manifest_path(store_path)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def manifest_matches(manifest: dict, config: Config, grid_fp: str, years_per_time_chunk: int) -> bool:
+    """Whether an existing manifest was produced by a run with the same
+    shape-relevant parameters as the one about to start (so its recorded
+    date range and completed-step count can be safely reused)."""
+    return (
+        manifest.get("grid_fingerprint") == grid_fp
+        and manifest.get("batch_size") == config.batch_size
+        and manifest.get("time_chunk_years") == years_per_time_chunk
+        and manifest.get("point_chunk") == config.point_chunk
+        and manifest.get("time_chunk_days") == config.time_chunk_days
+        and manifest.get("zstd_level") == config.zstd_level
+        and manifest.get("variables") == list(config.variables)
+    )
+
+
+def write_manifest(
+    store_path: str,
+    config: Config,
+    grid_fp: str,
+    years_per_time_chunk: int,
+    start_date: _dt.date,
+    end_date: _dt.date,
+    completed_steps: int,
+) -> None:
+    manifest = {
+        "grid_fingerprint": grid_fp,
+        "batch_size": config.batch_size,
+        "time_chunk_years": years_per_time_chunk,
+        "point_chunk": config.point_chunk,
+        "time_chunk_days": config.time_chunk_days,
+        "zstd_level": config.zstd_level,
+        "variables": list(config.variables),
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "completed_steps": completed_steps,
+    }
+    with open(_manifest_path(store_path), "w") as fh:
+        json.dump(manifest, fh)

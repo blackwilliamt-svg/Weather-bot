@@ -73,90 +73,128 @@ def run_pipeline(
 ) -> dict:
     """Runs the full batch loop for a given point set and date range.
 
+    Resumable: if a matching, unfinished run was interrupted previously (same
+    store path, grid, chunking, and — critically — the same start/end date,
+    which callers must resolve via a manifest rather than recomputing "today"
+    fresh; see run_full_mode), already-completed batches are skipped instead
+    of re-fetched, and the store is not re-initialized (which would wipe it).
+
     on_progress(ProgressInfo), if given, is called after each fetched+written
     batch. Returns a summary dict:
-    {n_points, n_batches, bytes_downloaded, elapsed_sec, failures: [...]}.
+    {n_points, n_batches, resumed_from, bytes_downloaded, elapsed_sec, failures: [...]}.
     """
-    full_time_index = store.build_time_index(config, end_date)
-    store.init_store(config.store_path, points, full_time_index, config)
+    point_batches = list(_iter_point_batches(points, config.batch_size))
+    time_chunks = list(_iter_time_chunks(start_date, end_date, years_per_time_chunk))
+    total_steps = len(point_batches) * len(time_chunks)
+    grid_fp = store.grid_fingerprint(points)
+
+    manifest = store.read_manifest(config.store_path)
+    resumed_from = 0
+    if manifest is not None and store.manifest_matches(manifest, config, grid_fp, years_per_time_chunk) \
+            and manifest.get("start_date") == start_date.isoformat() \
+            and manifest.get("end_date") == end_date.isoformat():
+        resumed_from = min(int(manifest.get("completed_steps", 0)), total_steps)
+
+    if resumed_from == 0:
+        full_time_index = store.build_time_index(config, end_date)
+        store.init_store(config.store_path, points, full_time_index, config)
 
     session = fetch.build_session(config)
     limiter = fetch.RateLimiter(config.rate_limit_per_sec)
 
     failures: list[dict] = []
-    point_batches = list(_iter_point_batches(points, config.batch_size))
-    time_chunks = list(_iter_time_chunks(start_date, end_date, years_per_time_chunk))
-    total_steps = len(point_batches) * len(time_chunks)
-    step = 0
+    step = resumed_from
     bytes_downloaded = 0
     start_time = time.monotonic()
 
-    for batch in point_batches:
+    if resumed_from > 0 and on_progress is not None:
+        on_progress(ProgressInfo(resumed_from, total_steps,
+                                  "resuming previous run...", 0, 0.0, None))
+    elif resumed_from > 0:
+        log.info("resuming: skipping %d/%d already-completed batches", resumed_from, total_steps)
+
+    flat_steps = [(batch, chunk_start, chunk_end)
+                  for batch in point_batches for chunk_start, chunk_end in time_chunks]
+
+    for idx, (batch, chunk_start, chunk_end) in enumerate(flat_steps):
+        if idx < resumed_from:
+            continue  # already fetched and written in a previous run
+
         point_start = int(batch["point_id"].iloc[0])
         point_stop = int(batch["point_id"].iloc[-1]) + 1
         point_slice = slice(point_start, point_stop)
 
-        for chunk_start, chunk_end in time_chunks:
-            n_days = (chunk_end - chunk_start).days + 1
-            time_offset = store.date_to_offset(chunk_start, config)
-            time_slice = slice(time_offset, time_offset + n_days)
+        n_days = (chunk_end - chunk_start).days + 1
+        time_offset = store.date_to_offset(chunk_start, config)
+        time_slice = slice(time_offset, time_offset + n_days)
 
-            outcome = fetch.fetch_batch(batch, chunk_start, chunk_end, config, session, limiter)
-            results = outcome.results
-            bytes_downloaded += outcome.bytes_downloaded
+        outcome = fetch.fetch_batch(batch, chunk_start, chunk_end, config, session, limiter)
+        results = outcome.results
+        bytes_downloaded += outcome.bytes_downloaded
 
-            data: dict[str, np.ndarray] = {
-                var: np.full((len(batch), n_days), np.nan, dtype=np.float32)
-                for var in config.variables
-            }
-            for row_idx, result in enumerate(results):
-                if result.error is not None or result.daily is None:
-                    failures.append({
-                        "point_id": result.point_id,
-                        "lat": result.lat,
-                        "lon": result.lon,
-                        "time_range": f"{chunk_start.isoformat()}..{chunk_end.isoformat()}",
-                        "reason": result.error or "no data",
-                        "timestamp": _dt.datetime.utcnow().isoformat(),
-                    })
-                    continue
-                row_ok = True
-                row_data = {}
-                for var in config.variables:
-                    row = _daily_row(result.daily, var, n_days)
-                    if row is None:
-                        row_ok = False
-                        break
-                    row_data[var] = row
-                if not row_ok:
-                    failures.append({
-                        "point_id": result.point_id,
-                        "lat": result.lat,
-                        "lon": result.lon,
-                        "time_range": f"{chunk_start.isoformat()}..{chunk_end.isoformat()}",
-                        "reason": "response length mismatch or missing variable",
-                        "timestamp": _dt.datetime.utcnow().isoformat(),
-                    })
-                    continue
-                for var, row in row_data.items():
-                    data[var][row_idx, :] = row
+        data: dict[str, np.ndarray] = {
+            var: np.full((len(batch), n_days), np.nan, dtype=np.float32)
+            for var in config.variables
+        }
+        for row_idx, result in enumerate(results):
+            if result.error is not None or result.daily is None:
+                failures.append({
+                    "point_id": result.point_id,
+                    "lat": result.lat,
+                    "lon": result.lon,
+                    "time_range": f"{chunk_start.isoformat()}..{chunk_end.isoformat()}",
+                    "reason": result.error or "no data",
+                    "timestamp": _dt.datetime.utcnow().isoformat(),
+                })
+                continue
+            row_ok = True
+            row_data = {}
+            for var in config.variables:
+                row = _daily_row(result.daily, var, n_days)
+                if row is None:
+                    row_ok = False
+                    break
+                row_data[var] = row
+            if not row_ok:
+                failures.append({
+                    "point_id": result.point_id,
+                    "lat": result.lat,
+                    "lon": result.lon,
+                    "time_range": f"{chunk_start.isoformat()}..{chunk_end.isoformat()}",
+                    "reason": "response length mismatch or missing variable",
+                    "timestamp": _dt.datetime.utcnow().isoformat(),
+                })
+                continue
+            for var, row in row_data.items():
+                data[var][row_idx, :] = row
 
-            store.write_region(config.store_path, data, point_slice, time_slice)
-            step += 1
-            elapsed_sec = time.monotonic() - start_time
-            eta_sec = (elapsed_sec / step) * (total_steps - step) if step > 0 else None
-            message = (f"points {point_slice.start}-{point_slice.stop - 1}, "
-                       f"{chunk_start.isoformat()}..{chunk_end.isoformat()}")
-            if on_progress is not None:
-                on_progress(ProgressInfo(step, total_steps, message, bytes_downloaded, elapsed_sec, eta_sec))
-            else:
-                log.info("batch %d/%d done (%s) — %.1f MB downloaded so far",
-                          step, total_steps, message, bytes_downloaded / 1e6)
+        store.write_region(config.store_path, data, point_slice, time_slice)
+        step = idx + 1
+        store.write_manifest(config.store_path, config, grid_fp, years_per_time_chunk,
+                              start_date, end_date, step)
+
+        steps_done_this_session = step - resumed_from
+        elapsed_sec = time.monotonic() - start_time
+        eta_sec = (elapsed_sec / steps_done_this_session) * (total_steps - step) \
+            if steps_done_this_session > 0 else None
+        message = (f"points {point_slice.start}-{point_slice.stop - 1}, "
+                   f"{chunk_start.isoformat()}..{chunk_end.isoformat()}")
+        if on_progress is not None:
+            on_progress(ProgressInfo(step, total_steps, message, bytes_downloaded, elapsed_sec, eta_sec))
+        else:
+            log.info("batch %d/%d done (%s) — %.1f MB downloaded so far",
+                      step, total_steps, message, bytes_downloaded / 1e6)
 
     store.finalize_store(config.store_path)
+    # Deliberately not cleared: keeping the manifest (now at completed_steps
+    # == total_steps) makes a finished run idempotent — rerunning with the
+    # same parameters recognizes it's already fully fetched and does nothing,
+    # rather than wiping and re-fetching a store that didn't need it.
     return {
         "n_points": len(points),
         "n_batches": total_steps,
+        "resumed_from": resumed_from,
+        "already_complete": resumed_from >= total_steps,
         "bytes_downloaded": bytes_downloaded,
         "elapsed_sec": time.monotonic() - start_time,
         "failures": failures,
@@ -254,9 +292,27 @@ def estimate_run(config: Config, mode: str) -> dict:
     }
 
 
+def _resolve_end_date(config: Config, points: pd.DataFrame, years_per_time_chunk: int) -> _dt.date:
+    """end_date normally means "today minus the archive lag", which drifts
+    day to day — fine for a single run, but a resumed run days later must
+    reuse whatever end_date the ORIGINAL run committed to, or every batch
+    already fetched near the end of the range would mismatch and force a
+    full restart. If a matching in-progress manifest exists, reuse its
+    end_date; otherwise resolve a fresh one from today."""
+    manifest = store.read_manifest(config.store_path)
+    if manifest is not None:
+        grid_fp = store.grid_fingerprint(points)
+        if store.manifest_matches(manifest, config, grid_fp, years_per_time_chunk):
+            try:
+                return _dt.date.fromisoformat(manifest["end_date"])
+            except (KeyError, ValueError):
+                pass
+    return config.end_date()
+
+
 def run_test_mode(config: Config, on_progress: Optional[ProgressCallback] = None) -> dict:
     points = grid.generate_test_grid(config, TEST_MODE_POINTS)
-    end_date = config.end_date()
+    end_date = _resolve_end_date(config, points, config.time_chunk_years)
     start_date = (pd.Timestamp(end_date) - pd.DateOffset(years=TEST_MODE_YEARS)).date()
     return run_pipeline(config, points, start_date, end_date,
                          years_per_time_chunk=config.time_chunk_years, on_progress=on_progress)
@@ -264,7 +320,7 @@ def run_test_mode(config: Config, on_progress: Optional[ProgressCallback] = None
 
 def run_full_mode(config: Config, on_progress: Optional[ProgressCallback] = None) -> dict:
     points = grid.generate_full_grid(config)
-    end_date = config.end_date()
+    end_date = _resolve_end_date(config, points, config.time_chunk_years)
     return run_pipeline(
         config, points, config.archive_start_date, end_date,
         years_per_time_chunk=config.time_chunk_years, on_progress=on_progress,

@@ -106,6 +106,24 @@ At the end, a summary is shown (in the GUI log/popup, or printed to the
 console for the CLI) and the full list is written to
 `<store_path>.failures_<timestamp>.json` next to the store.
 
+## Interruptions and resuming
+
+A full pull can take a long time (see the estimate the app shows before you
+confirm — often days, not hours, at the default rate limit), so it's built to
+survive being interrupted: reboot, sleep, closing the app, a power loss,
+whatever. Progress is checkpointed to `<store_path>.progress.json` after
+every fetched batch. Re-running the same mode against the same store just
+picks up where it left off instead of starting over — it won't re-fetch
+already-completed batches or wipe the store. If a run finishes completely,
+that checkpoint stays in place, so re-running it again is a fast no-op rather
+than an accidental full re-pull.
+
+This only works as long as the underlying parameters haven't changed (grid,
+chunk sizes, variables, compression level) — change any of those and it
+starts a fresh run against that store path instead, same as if no checkpoint
+existed. If you ever want to force a clean re-pull, delete both the
+`.progress.json` file and the store folder.
+
 ## Seam for future phases
 
 Don't reach into the zarr store directly from new code. Use

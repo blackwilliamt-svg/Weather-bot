@@ -181,9 +181,24 @@ class WeatherBotApp:
         summary = payload["summary"]
         downloaded = pipeline.format_bytes(summary["bytes_downloaded"])
         elapsed = pipeline.format_duration(summary["elapsed_sec"])
+
+        if summary["already_complete"]:
+            self._append_log(
+                f"--- Already complete: all {summary['n_batches']} files were fetched by a "
+                "previous run. Nothing to do. ---"
+            )
+            self.stats_var.set(f"Already complete: {summary['n_batches']} files")
+            messagebox.showinfo(
+                "WeatherBot",
+                f"Already complete.\n{summary['n_points']} points, {summary['n_batches']} files "
+                f"were all fetched by a previous run.\nStore: {payload['store_path']}",
+            )
+            return
+
+        resumed_note = f" (resumed from file {summary['resumed_from']})" if summary["resumed_from"] else ""
         self._append_log(
-            f"--- Done: {summary['n_points']} points, {summary['n_batches']} files fetched, "
-            f"{downloaded} downloaded in {elapsed} ---"
+            f"--- Done{resumed_note}: {summary['n_points']} points, {summary['n_batches']} files total, "
+            f"{downloaded} downloaded this session in {elapsed} ---"
         )
         self._append_log(payload["failure_text"])
         if payload["log_path"]:
