@@ -1,0 +1,9 @@
+requests
+numpy
+pandas
+xarray
+zarr<3
+numcodecs
+dask[array]
+global-land-mask
+tqdm
