@@ -38,6 +38,7 @@ class ProgressInfo:
     bytes_downloaded: int  # cumulative, across the whole run so far
     elapsed_sec: float
     eta_sec: Optional[float]  # None until at least one step has completed
+    failures_so_far: int = 0  # points/batches skipped so far this run
 
 
 ProgressCallback = Callable[[ProgressInfo], None]
@@ -185,7 +186,8 @@ def run_pipeline(
         message = (f"points {point_slice.start}-{point_slice.stop - 1}, "
                    f"{chunk_start.isoformat()}..{chunk_end.isoformat()}")
         if on_progress is not None:
-            on_progress(ProgressInfo(step, total_steps, message, bytes_downloaded, elapsed_sec, eta_sec))
+            on_progress(ProgressInfo(step, total_steps, message, bytes_downloaded, elapsed_sec, eta_sec,
+                                      failures_so_far=len(failures)))
         else:
             log.info("batch %d/%d done (%s) — %.1f MB downloaded so far",
                       step, total_steps, message, bytes_downloaded / 1e6)
@@ -237,6 +239,7 @@ def run_pipeline(
                         step, total_steps,
                         f"{limit_name} rate limit hit — stopping (resumable)",
                         bytes_downloaded, time.monotonic() - start_time, None,
+                        failures_so_far=len(failures),
                     ))
                 break
 

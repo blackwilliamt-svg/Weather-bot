@@ -123,6 +123,113 @@ At the fixed full-pull pace, the app's upfront estimate (~3.8 days at
 current defaults) is the actual expected duration, not just a best case —
 verify it against the live ETA once you start a run.
 
+## Running full pull on a droplet
+
+A ~3.8-day continuous run isn't something to leave running on a Windows
+machine you need to use/sleep/reboot. Full pull mode is plain CLI — no GUI
+dependency at all — so it runs fine headless on a small Linux droplet; test
+mode stays a local Windows GUI run as before, this section is full pull only.
+
+### One-time droplet setup
+
+On a fresh Ubuntu/Debian droplet:
+
+```bash
+sudo apt update && sudo apt install -y python3 python3-venv git
+git clone https://github.com/blackwilliamt-svg/Weather-bot.git weatherbot
+cd weatherbot
+chmod +x setup.sh && ./setup.sh
+```
+
+`setup.sh` is `setup.bat`'s Linux equivalent — creates `.venv`, installs
+`requirements.txt`. Same dependencies as Windows; nothing in them is
+platform-specific.
+
+### Starting it so it survives disconnects AND reboots
+
+A plain `nohup ... &` survives your SSH session ending, but not a droplet
+reboot. Since this is checkpointed (see "Interruptions and resuming") and
+expected to run for days, a **systemd service** is the more robust choice —
+it restarts automatically on a crash or reboot, with no one needing to
+notice and re-launch it:
+
+```bash
+# edit YOUR_USERNAME and the paths in weatherbot.service first, then:
+sudo cp weatherbot.service /etc/systemd/system/weatherbot.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now weatherbot
+```
+
+`Restart=on-failure` plus the checkpoint/resume support means a reboot or
+crash just picks up from the last completed batch — nothing is lost or
+re-fetched. If you'd rather not deal with systemd, the simpler alternative
+is a `tmux`/`screen` session (`tmux new -s weatherbot`, run the fetch
+command inside it, detach with `Ctrl-b d`) — that survives your SSH
+disconnecting but NOT a reboot, so only use it if you're confident the
+droplet won't restart during the run.
+
+### Checking progress remotely
+
+- **`journalctl -u weatherbot -f`** — live-tails the service's output (one
+  line roughly every 9 seconds, matching the fixed pace) if you used systemd.
+- **`cat data/weather_archive.zarr.status.json`** (or
+  `watch -n 30 cat data/weather_archive.zarr.status.json` to auto-refresh) —
+  a small JSON snapshot updated after every batch: `step`/`total_steps`/
+  `percent`, `bytes_downloaded`, `elapsed`/`eta`, and `failures_so_far`. This
+  works regardless of how you started the process.
+- **`python -m weatherbot inventory --store data/weather_archive.zarr`** —
+  the same inventory command as local use, run over SSH: point count, date
+  range, variables, size on disk so far.
+- Failed grid points accumulate in `data/weather_archive.zarr.failures_*.json`
+  as always (skip-and-log, not fatal) — check it once the run finishes, or
+  any time via `cat`.
+
+### Disk space — read this before starting
+
+The estimated compressed store size is **~18-27GB**, and this droplet's SSD
+is **~25GB total**, some of which the OS/Python/venv already use. **The
+store alone may not comfortably fit**, and definitely won't if you also try
+to make a copy of it (see below). Before starting a multi-day run, either:
+
+- Attach a separate DigitalOcean **Volume** (block storage) and point
+  `--store` at a path on it, so the store doesn't compete with the boot
+  disk at all, or
+- Resize the droplet to a larger disk tier first.
+
+Either way, keep an eye on `df -h` during the run — it's much better to
+notice this early than to have the pull fail from a full disk on day 3.
+
+### Downloading the finished store
+
+**Don't tar it first.** A zarr store this size, tar'd into a single archive
+*on the same disk*, needs roughly double the space (original + archive) —
+which won't fit on an already-tight 25GB disk. Transfer the directory
+directly instead; `rsync` handles "one large directory of many small files"
+far better than a naive recursive copy, and — usefully for a large transfer
+over a home connection — it's resumable: if it drops partway through,
+re-running the exact same command only transfers what's missing/changed.
+
+From Windows, the simplest way to get `rsync` is via WSL (`wsl --install`,
+then `sudo apt install -y rsync` inside it once):
+
+```bash
+# run from inside WSL; /mnt/e/... reaches your Windows E: drive
+rsync -avz --progress \
+    your_user@droplet_ip:~/weatherbot/data/weather_archive.zarr/ \
+    "/mnt/e/Weather Bot/data/weather_archive.zarr/"
+```
+
+If you'd rather not set up WSL, plain `scp` (built into PowerShell on modern
+Windows) works too, just without the resumability or the efficiency on many
+small files — expect it to be slower for a store this size:
+
+```powershell
+scp -r your_user@droplet_ip:~/weatherbot/data/weather_archive.zarr "E:\Weather Bot\data\weather_archive.zarr"
+```
+
+WinSCP is a reasonable GUI alternative to either — point it at the same
+remote path and it handles resuming an interrupted transfer on its own.
+
 ## Geographic coverage
 
 The default grid covers central/eastern North America (roughly 29-45°N,

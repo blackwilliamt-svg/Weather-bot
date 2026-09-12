@@ -1,0 +1,23 @@
+[Unit]
+Description=WeatherBot full pull (Open-Meteo ingestion)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# EDIT these two to match where you cloned/copied the repo and the user
+# that owns it (your normal login user is fine for a personal droplet).
+User=YOUR_USERNAME
+WorkingDirectory=/home/YOUR_USERNAME/weatherbot
+ExecStart=/home/YOUR_USERNAME/weatherbot/.venv/bin/python -m weatherbot fetch --mode full
+
+# Full pull checkpoints after every batch (see "Interruptions and resuming"
+# in README.md), so restarting it -- whether from a crash, an OOM kill, or
+# the droplet rebooting -- just resumes from the last completed batch. Safe
+# to let systemd restart it automatically rather than needing anyone to
+# notice and re-launch it by hand.
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
