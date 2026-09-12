@@ -339,14 +339,16 @@ def estimate_run(config: Config, mode: str) -> dict:
     n_requests = n_point_batches * n_time_chunks
 
     raw_bytes = n_points * n_days * n_vars * 4
-    # Absolute floor from the shared rate-limit pacing alone (dispatches are
-    # globally spaced >= 1/rate_limit_per_sec apart no matter how many
-    # workers are concurrent — see fetch.AdaptiveRateLimiter). Concurrency
-    # can approach this floor by overlapping response latency across
-    # workers, but can't beat it, and how CLOSE it gets depends on the real
-    # per-request latency, which this can't predict without a live
-    # measurement — treat this as a best case, not the expected time.
-    min_seconds = n_requests / config.rate_limit_per_sec if config.rate_limit_per_sec > 0 else None
+    if mode == "full":
+        # Full pull is fixed-pace, sequential (concurrency 1) — see
+        # run_full_mode — so this isn't a best case, it's the actual expected
+        # duration: n_requests * the fixed per-request interval, plus
+        # whatever small overhead individual requests add beyond that.
+        min_seconds = n_requests * config.full_pull_request_interval_sec
+    else:
+        # Test mode fetches fast/adaptively (see run_test_mode); this is only
+        # the pacing floor concurrency approaches, not a guaranteed time.
+        min_seconds = n_requests / config.rate_limit_per_sec if config.rate_limit_per_sec > 0 else None
     return {
         "n_points": n_points,
         "n_days": n_days,
@@ -394,10 +396,21 @@ def run_full_mode(
     on_progress: Optional[ProgressCallback] = None,
     should_stop: Optional[Callable[[], bool]] = None,
 ) -> dict:
+    """Full pull ALWAYS paces at config.full_pull_request_interval_sec with
+    concurrency 1, regardless of config.rate_limit_per_sec/concurrency (those
+    apply to test mode only). This takes priority over general fetch-speed
+    settings by design: Open-Meteo's daily request quota, not the per-minute
+    or per-hour ones, is what actually bounds a sustained multi-day pull —
+    bursting faster just hits the daily cap sooner and then sits idle until
+    it resets, it doesn't finish the pull any sooner overall."""
     points = grid.generate_full_grid(config)
     end_date = _resolve_end_date(config, points, config.time_chunk_years)
+    paced_config = config.with_overrides(
+        rate_limit_per_sec=1.0 / config.full_pull_request_interval_sec,
+        concurrency=1,
+    )
     return run_pipeline(
-        config, points, config.archive_start_date, end_date,
+        paced_config, points, config.archive_start_date, end_date,
         years_per_time_chunk=config.time_chunk_years,
         on_progress=on_progress, should_stop=should_stop,
     )

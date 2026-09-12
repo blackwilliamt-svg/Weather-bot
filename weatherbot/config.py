@@ -79,12 +79,24 @@ class Config:
     # on that budget, not on how it's split between locations vs. years.
     batch_size: int = 20  # locations per HTTP request
     time_chunk_years: int = 3  # years of data fetched per HTTP request, both modes
+    # concurrency/rate_limit_per_sec below apply to TEST MODE only — it's a
+    # short validation run, not subject to the multi-day daily-quota budget,
+    # so it's fine to fetch fast and adaptively. Full pull mode ALWAYS uses
+    # full_pull_request_interval_sec at concurrency 1 instead (see
+    # pipeline.run_full_mode) — Open-Meteo's free tier caps out at 600
+    # calls/minute, 5,000/hour, AND 10,000/day, and for a sustained multi-day
+    # pull the DAILY cap is the real bottleneck: bursting up to the minute/
+    # hour limits just hits the daily one sooner, then sits idle until reset.
+    # A fixed one-request-per-9s drip (~9,600/day) stays under all three
+    # continuously, with margin below the exact 8.64s/request ceiling
+    # (86400s / 10000), and needs no reactive backoff to stay safe.
     concurrency: int = 4  # concurrent in-flight requests (bounded worker pool)
     # rate_limit_per_sec is the FLOOR pace per lane absent any backoff (not a
     # fixed throttle) — the adaptive limiter in fetch.py starts here and only
     # slows down in response to actual 429s/errors, speeding back up on a
     # success streak. See fetch.AdaptiveRateLimiter.
     rate_limit_per_sec: float = 2.0
+    full_pull_request_interval_sec: float = 9.0  # full pull's fixed, sequential pace
     max_backoff_sec: float = 90.0  # ceiling on the adaptive limiter's backoff
     max_retries: int = 5
     backoff_base_sec: float = 2.0

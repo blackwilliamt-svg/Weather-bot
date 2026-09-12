@@ -24,8 +24,13 @@ def build_parser() -> argparse.ArgumentParser:
     fetch_p.add_argument("--zstd-level", type=int, default=None)
     fetch_p.add_argument("--batch-size", type=int, default=None)
     fetch_p.add_argument("--time-chunk-years", type=int, default=None)
-    fetch_p.add_argument("--rate-limit", dest="rate_limit_per_sec", type=float, default=None)
-    fetch_p.add_argument("--concurrency", type=int, default=None)
+    fetch_p.add_argument("--rate-limit", dest="rate_limit_per_sec", type=float, default=None,
+                          help="test mode only -- full pull always uses --full-pull-interval-sec")
+    fetch_p.add_argument("--concurrency", type=int, default=None,
+                          help="test mode only -- full pull always runs sequentially (concurrency 1)")
+    fetch_p.add_argument("--full-pull-interval-sec", dest="full_pull_request_interval_sec",
+                          type=float, default=None,
+                          help="full pull's fixed, sequential per-request pace (default: 9s)")
 
     inv_p = sub.add_parser("inventory", help="Inspect an existing zarr store")
     inv_p.add_argument("--store", dest="store_path", default=DEFAULT_CONFIG.store_path)
@@ -53,17 +58,24 @@ def main(argv: list[str] | None = None) -> int:
             time_chunk_years=args.time_chunk_years,
             rate_limit_per_sec=args.rate_limit_per_sec,
             concurrency=args.concurrency,
+            full_pull_request_interval_sec=args.full_pull_request_interval_sec,
         )
 
         est = pipeline.estimate_run(config, args.mode)
+        if args.mode == "full":
+            pace_note = (f"fixed pace, 1 request/{config.full_pull_request_interval_sec:g}s, "
+                         "sequential")
+            time_label = "Expected time"
+        else:
+            pace_note = f"concurrency={config.concurrency}, adaptive pacing"
+            time_label = "Best-case time (pacing floor, unlimited concurrency)"
         print(f"Estimate: {est['n_points']:,} points x {est['n_days']:,} days x "
               f"{len(config.variables)} variables, over {est['n_requests']:,} requests "
-              f"(concurrency={config.concurrency}). "
+              f"({pace_note}). "
               f"Store size ~{pipeline.format_bytes(est['compressed_bytes_low'])}-"
               f"{pipeline.format_bytes(est['compressed_bytes_high'])} compressed "
               f"({pipeline.format_bytes(est['raw_bytes'])} raw). "
-              f"Best-case time (pacing floor, unlimited concurrency): "
-              f"{pipeline.format_duration(est['min_seconds'])}.\n")
+              f"{time_label}: {pipeline.format_duration(est['min_seconds'])}.\n")
 
         with tqdm(desc="fetching", unit="batch") as pbar:
             def on_progress(info: pipeline.ProgressInfo) -> None:
