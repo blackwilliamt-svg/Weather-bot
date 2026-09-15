@@ -1,4 +1,4 @@
-"""North America land grid point generation.
+"""Contiguous U.S. (CONUS) land grid point generation.
 
 Builds a lat/lon grid over a bounding box at a configurable spacing, then
 filters to land points using global_land_mask (no shapefile download needed).

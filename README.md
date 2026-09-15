@@ -1,8 +1,9 @@
 # WeatherBot — Phase 1: Data Ingestion
 
 Fetches historical daily weather from Open-Meteo's historical archive API for
-land grid points across North America, downcasts to float32, and stores it in
-a chunked, zstd-compressed Zarr archive queryable with xarray.
+land grid points across the contiguous United States (CONUS), downcasts to
+float32, and stores it in a chunked, zstd-compressed Zarr archive queryable
+with xarray.
 
 This phase is ingestion only. Training, Monte Carlo simulation, and any
 dashboard are future phases — see "Seam for future phases" below.
@@ -24,12 +25,12 @@ Double-click **`WeatherBot.bat`**. A window opens with four buttons:
 - **Run Test Pull** — 20 grid points, last 10 years of data. Finishes in a
   couple of minutes; use this to confirm everything works before committing
   to the full pull. Writes to `data/weather_test.zarr`.
-- **Run Full Pull** — the real archive: ~19,000-26,000 land grid points across
-  North America, 1940-present, roughly 18-27GB compressed. The app shows an
-  exact estimate (points/days/requests/size/best-case time) before you
-  confirm — see "Fetch performance" below for what actually governs how long
-  it takes. Leave the computer on and connected to the internet while it
-  runs. Writes to `data/weather_archive.zarr`.
+- **Run Full Pull** — the real archive: ~4,300 land grid points across the
+  contiguous United States, 1990-present, roughly 1.3-2.1GB compressed. The
+  app shows an exact estimate (points/days/requests/size/best-case time)
+  before you confirm — see "Fetch performance" below for what actually
+  governs how long it takes. Leave the computer on and connected to the
+  internet while it runs. Writes to `data/weather_archive.zarr`.
 - **Show Inventory** — pick any `.zarr` folder under `data/` and see what's in
   it so far: point count, date range, variables, and size on disk — without
   loading the actual weather data into memory.
@@ -62,7 +63,7 @@ Grid density, chunking, batching, pacing, and concurrency are all configurable
 rather than hardcoded:
 
 ```bash
-.venv\Scripts\python.exe -m weatherbot fetch --mode full --spacing-deg 0.15 \
+.venv\Scripts\python.exe -m weatherbot fetch --mode full --spacing-deg 0.5 \
     --point-chunk 50 --time-chunk-days 365 --zstd-level 12 \
     --batch-size 20 --time-chunk-years 3 --full-pull-interval-sec 9
 ```
@@ -74,12 +75,12 @@ paces at `--full-pull-interval-sec`, sequentially. See "Fetch performance".)
 
 Open-Meteo's free/keyless tier has three request-volume caps: 600/minute,
 5,000/hour, and 10,000/day. For a one-off small pull, the minute/hour caps
-are what you'd notice. For the **full pull specifically** — tens of
-thousands of requests over multiple days — the **daily** cap is the one that
-actually governs total completion time: bursting up to the minute/hour
-limits just hits the daily one sooner and then sits idle until it resets,
-it doesn't finish any sooner overall. So full pull and test mode are paced
-differently on purpose:
+are what you'd notice. For the **full pull specifically** — thousands of
+requests, comfortably finishing within a day at this reduced scope — the
+**daily** cap is still the one that actually governs total completion time:
+bursting up to the minute/hour limits just hits the daily one sooner and
+then sits idle until it resets, it doesn't finish any sooner overall. So
+full pull and test mode are paced differently on purpose:
 
 - **Full pull mode: fixed, sequential pacing.** One batched request every
   `--full-pull-interval-sec` (default 9s — 86,400s/day ÷ 10,000 requests =
@@ -97,10 +98,10 @@ differently on purpose:
   "location-years per request". Empirically, 15 locations x 10 years (150
   location-years) gets rejected outright while 3 x 10 (30) succeeds; the
   defaults (20 x 3 = 60) sit with margin on both sides, found by testing
-  against the live API, not guessed. This is what got full pull's request
-  count down to ~36,700 (from ~111,000 at the original 10x2 defaults) — at
-  the fixed 9s pace, that's the difference between an ~11-day run and an
-  ~3.8-day one.
+  against the live API, not guessed. At the current CONUS/0.5° scope
+  (~4,300 points, 1990-present) that keeps full pull's request count to
+  ~2,850 (vs. ~8,300 at a naive 10x2 batching) — at the fixed 9s pace,
+  that's the difference between a ~7-hour run and a ~21-hour one.
 - **Test mode** stays fast and adaptive — several batches at once
   (`--concurrency`, default 4) with a rate limiter that starts fast and only
   backs off after an actual 429 (shared across workers, so one worker's 429
@@ -119,16 +120,17 @@ pacing, but is handled if it does) doesn't retry in a loop or get recorded
 as a failure — the run stops cleanly and is fully resumable once the budget
 resets, exactly like the Stop button (see "Interruptions and resuming").
 
-At the fixed full-pull pace, the app's upfront estimate (~3.8 days at
+At the fixed full-pull pace, the app's upfront estimate (~7 hours at
 current defaults) is the actual expected duration, not just a best case —
 verify it against the live ETA once you start a run.
 
 ## Running full pull on a droplet
 
-A ~3.8-day continuous run isn't something to leave running on a Windows
-machine you need to use/sleep/reboot. Full pull mode is plain CLI — no GUI
-dependency at all — so it runs fine headless on a small Linux droplet; test
-mode stays a local Windows GUI run as before, this section is full pull only.
+A ~7-hour continuous run is short enough to just leave a Windows machine on
+for, but if you'd rather not tie up a machine you need to use/sleep/reboot,
+full pull mode is plain CLI — no GUI dependency at all — so it also runs
+fine headless on a small Linux droplet; test mode stays a local Windows GUI
+run as before, this section is full pull only.
 
 ### One-time droplet setup
 
@@ -149,9 +151,9 @@ platform-specific.
 
 A plain `nohup ... &` survives your SSH session ending, but not a droplet
 reboot. Since this is checkpointed (see "Interruptions and resuming") and
-expected to run for days, a **systemd service** is the more robust choice —
-it restarts automatically on a crash or reboot, with no one needing to
-notice and re-launch it:
+expected to run for several hours, a **systemd service** is the more robust
+choice — it restarts automatically on a crash or reboot, with no one needing
+to notice and re-launch it:
 
 ```bash
 # edit YOUR_USERNAME and the paths in weatherbot.service first, then:
@@ -186,10 +188,10 @@ droplet won't restart during the run.
 
 ### Disk space — read this before starting
 
-The estimated compressed store size is **~18-27GB**, and this droplet's SSD
-is **~25GB total**, some of which the OS/Python/venv already use. **The
-store alone may not comfortably fit**, and definitely won't if you also try
-to make a copy of it (see below). Before starting a multi-day run, either:
+The estimated compressed store size is **~1.3-2.1GB**, comfortably inside a
+default **~25GB** droplet SSD even with the OS/Python/venv already on it. A
+separate DigitalOcean **Volume** is no longer necessary at this scope, but
+if you're running on a smaller droplet than that, either:
 
 - Attach a separate DigitalOcean **Volume** (block storage) and point
   `--store` at a path on it, so the store doesn't compete with the boot
@@ -197,17 +199,16 @@ to make a copy of it (see below). Before starting a multi-day run, either:
 - Resize the droplet to a larger disk tier first.
 
 Either way, keep an eye on `df -h` during the run — it's much better to
-notice this early than to have the pull fail from a full disk on day 3.
+notice this early than to have the pull fail from a full disk partway
+through.
 
 ### Downloading the finished store
 
-**Don't tar it first.** A zarr store this size, tar'd into a single archive
-*on the same disk*, needs roughly double the space (original + archive) —
-which won't fit on an already-tight 25GB disk. Transfer the directory
-directly instead; `rsync` handles "one large directory of many small files"
-far better than a naive recursive copy, and — usefully for a large transfer
-over a home connection — it's resumable: if it drops partway through,
-re-running the exact same command only transfers what's missing/changed.
+Transfer the directory directly rather than tarring it first — `rsync`
+handles "one large directory of many small files" far better than a naive
+recursive copy, and — usefully for a large transfer over a home connection —
+it's resumable: if it drops partway through, re-running the exact same
+command only transfers what's missing/changed.
 
 From Windows, the simplest way to get `rsync` is via WSL (`wsl --install`,
 then `sudo apt install -y rsync` inside it once):
@@ -232,20 +233,18 @@ remote path and it handles resuming an interrupted transfer on its own.
 
 ## Geographic coverage
 
-The default grid covers central/eastern North America (roughly 29-45°N,
-77-114°W) rather than the full continent. A full Central-America-to-Arctic-
-Canada/Alaska box at 0.14-0.16° spacing produces ~125,000 land points and a
-90GB+ compressed store — well past the ~19,000-26,000 point / ~25GB targets.
-This box was chosen to hit both targets at the target spacing; it's a plain
-constant (`NORTH_AMERICA_BBOX` in `config.py`), so widening it is a one-line
-change if you'd rather have full continental coverage at the cost of a much
-larger store.
+The grid covers only the contiguous United States (CONUS) — roughly
+24-50°N, 125-66.5°W — at 0.5° (~55km) spacing, land points only. Alaska,
+Hawaii, and the rest of North America (Canada, Mexico, Central America) are
+explicitly out of scope for this reduced-scope build; the bounding box is a
+plain constant (`CONUS_BBOX` in `config.py`), so widening it is a one-line
+change if you'd rather have broader coverage at the cost of a larger store.
 
 ## Storage format
 
 - Zarr store, dims `(point, time)`. `point` is a stable integer index into the
   land-filtered grid (sorted by lat, then lon); `lat`/`lon` are coordinates
-  indexed by `point`. `time` is a daily `datetime64` index from 1940-01-01.
+  indexed by `point`. `time` is a daily `datetime64` index from 1990-01-01.
 - All data variables are `float32`, compressed with `numcodecs.Zstd` at a
   configurable "mid" level (default 12; range 1-22) — lossless beyond the
   float32 downcast itself.

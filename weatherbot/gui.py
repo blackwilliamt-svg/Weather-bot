@@ -133,9 +133,9 @@ class WeatherBotApp:
         estimate = self._estimate_text("full")
         warning = (
             f"This will fetch:\n\n{estimate}\n\n"
-            "This can take a long time (potentially days) at the default "
-            "rate limit. Run this on a machine you can leave on and "
-            "connected to the internet for a while.\n\nContinue?"
+            "This can take a while at the default rate limit — see the "
+            "expected time above. Run this on a machine you can leave on "
+            "and connected to the internet until it finishes.\n\nContinue?"
         )
         if not messagebox.askyesno("Run full pull?", warning):
             return

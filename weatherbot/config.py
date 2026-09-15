@@ -33,16 +33,16 @@ DAILY_VARIABLES: list[str] = [
 
 OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 
-# Land-focused bounding box (lat_min, lat_max, lon_min, lon_max): central/
-# eastern North America. Deliberately narrower than the full continent — a
-# full Central-America-to-Arctic-Canada/Alaska box at 0.14-0.16 deg spacing
-# yields ~125,000 land points and a >90GB compressed store, blowing past both
-# the ~19k-26k point and ~25GB storage targets by ~5x. This box was chosen
-# (confirmed with the user) to hit both targets at the target spacing;
-# widening it is a config change away, at the cost of those budgets.
-NORTH_AMERICA_BBOX = (29.0, 45.0, -114.0, -77.0)
+# Land-focused bounding box (lat_min, lat_max, lon_min, lon_max): the
+# contiguous United States (CONUS) only — Alaska, Hawaii, and the rest of
+# North America (Canada, Mexico, Central America) are out of scope. This is
+# a reduced-scope config (confirmed with the user): a coarser 0.5 deg
+# (~55km) grid over a much smaller area than the old central/eastern North
+# America box, so both point count and storage footprint shrink accordingly.
+# Widening the box or tightening the spacing is a config change away.
+CONUS_BBOX = (24.0, 50.0, -125.0, -66.5)
 
-ARCHIVE_START_DATE = _dt.date(1940, 1, 1)
+ARCHIVE_START_DATE = _dt.date(1990, 1, 1)
 ARCHIVE_LAG_DAYS = 5  # Open-Meteo's archive typically lags a few days behind "today".
 
 TEST_MODE_POINTS = 20
@@ -57,8 +57,8 @@ DEFAULT_FULL_STORE_PATH = "data/weather_archive.zarr"
 @dataclass(frozen=True)
 class Config:
     # Grid
-    bbox: tuple[float, float, float, float] = NORTH_AMERICA_BBOX
-    spacing_deg: float = 0.15
+    bbox: tuple[float, float, float, float] = CONUS_BBOX
+    spacing_deg: float = 0.5
 
     # Zarr layout. run_test_mode/run_full_mode callers (CLI, GUI) resolve this
     # to DEFAULT_TEST_STORE_PATH / DEFAULT_FULL_STORE_PATH when not overridden.
