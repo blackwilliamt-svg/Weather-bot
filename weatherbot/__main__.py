@@ -1,15 +1,17 @@
-"""CLI entry point: python -m weatherbot <fetch|inventory> ..."""
+"""CLI entry point: python -m weatherbot <fetch|inventory|train|serve> ..."""
 from __future__ import annotations
 
 import argparse
 import datetime as _dt
 import json
 import logging
+import signal
 import sys
+import threading
 
 from tqdm import tqdm
 
-from . import inventory, pipeline
+from . import inventory, pipeline, train as train_module
 from .config import DEFAULT_CONFIG, DEFAULT_FULL_STORE_PATH, DEFAULT_TEST_STORE_PATH
 
 
@@ -62,6 +64,18 @@ def build_parser() -> argparse.ArgumentParser:
     inv_p = sub.add_parser("inventory", help="Inspect an existing zarr store")
     inv_p.add_argument("--store", dest="store_path", default=DEFAULT_CONFIG.store_path)
     inv_p.add_argument("--list-points", action="store_true")
+
+    train_p = sub.add_parser(
+        "train", help="Run continuous walk-forward training headlessly (no dashboard)"
+    )
+    train_p.add_argument("--store", dest="store_path", default=DEFAULT_CONFIG.store_path)
+
+    serve_p = sub.add_parser(
+        "serve", help="Launch the web dashboard (training + Monte Carlo simulation, with visualization/controls)"
+    )
+    serve_p.add_argument("--store", dest="store_path", default=DEFAULT_CONFIG.store_path)
+    serve_p.add_argument("--host", default="127.0.0.1")
+    serve_p.add_argument("--port", type=int, default=8000)
 
     return parser
 
@@ -146,8 +160,47 @@ def main(argv: list[str] | None = None) -> int:
         print(inventory.summarize(args.store_path, list_points=args.list_points))
         return 0
 
+    if args.command == "train":
+        return _run_train(args.store_path)
+
+    if args.command == "serve":
+        return _run_serve(args.store_path, args.host, args.port)
+
     parser.print_help()
     return 1
+
+
+def _run_train(store_path: str) -> int:
+    """Headless walk-forward training with no web UI -- for a droplet
+    that doesn't need visualization, or debugging. Runs until stopped:
+    Ctrl-C locally, or SIGTERM (what `systemctl stop` sends) on a droplet
+    both trigger a clean checkpoint-and-exit rather than an abrupt kill,
+    same philosophy as the fetch pipeline's Stop button.
+    """
+    stop_event = threading.Event()
+
+    def _handle_signal(signum, _frame):
+        print(f"\nReceived signal {signum} -- stopping after the current step (checkpointing)...")
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, _handle_signal)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, _handle_signal)
+
+    def on_progress(progress: train_module.TrainingProgress) -> None:
+        print(f"[{progress.phase}] {progress.current_date} — {progress.message}", flush=True)
+
+    train_module.run_walk_forward(store_path, on_progress=on_progress, should_stop=stop_event.is_set)
+    return 0
+
+
+def _run_serve(store_path: str, host: str, port: int) -> int:
+    from . import webapp  # deferred: only `serve` needs Flask installed
+
+    app = webapp.create_app(store_path)
+    print(f"WeatherBot dashboard at http://{host}:{port} (store: {store_path})")
+    app.run(host=host, port=port, threaded=True)
+    return 0
 
 
 if __name__ == "__main__":

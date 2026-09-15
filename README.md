@@ -1,12 +1,14 @@
-# WeatherBot — Phase 1: Data Ingestion
+# WeatherBot
 
 Fetches historical daily weather from Open-Meteo's historical archive API for
 land grid points across the contiguous United States (CONUS), downcasts to
 float32, and stores it in a chunked, zstd-compressed Zarr archive queryable
-with xarray.
+with xarray (**Phase 1: Data Ingestion**, below) — then continuously
+walk-forward trains a lightweight per-point forecasting model on that
+archive and uses it to run Monte Carlo forecast simulations, both viewable
+live in a web dashboard (**Phase 2: Modeling & Forecasting**, further down).
 
-This phase is ingestion only. Training, Monte Carlo simulation, and any
-dashboard are future phases — see "Seam for future phases" below.
+## Phase 1: Data Ingestion
 
 ## One-time setup (Windows)
 
@@ -47,6 +49,10 @@ two runs at once. If any grid points fail to fetch (network error, bad
 response, etc.), that's not fatal — they're skipped, and a summary shows up in
 the log and in a popup when the run finishes, with the full list saved next to
 the store as `<store_path>.failures_<timestamp>.json`.
+
+Once you have an archive, double-click **`WeatherBotDashboard.bat`** to open
+the training/forecasting dashboard in your browser — see "Phase 2: Modeling
+& Forecasting" below.
 
 ### Command line (optional)
 
@@ -284,11 +290,183 @@ existed. If you ever want to force a clean re-pull, delete both the
 
 Don't reach into the zarr store directly from new code. Use
 `weatherbot.inventory.open_store(path)` — it opens the store lazily via
-xarray/dask (no data materializes until you actually index/compute it), and
-is the intended entry point for the walk-forward training, Monte Carlo
-simulation, and dashboard phases that come after this one.
+xarray/dask (no data materializes until you actually index/compute it). This
+is exactly what `weatherbot/train.py` (Phase 2, below) uses to read the
+archive; nothing in that phase touches the zarr store's on-disk layout
+directly.
 
-Known limitation (by design, out of scope for this phase): a store's time
-extent is fixed at creation time. Extending an existing store with newer days
-without a full re-init is a future "incremental update" feature, not built
-here.
+Known limitation (by design, out of scope for the ingestion phase): a
+store's time extent is fixed at creation time. Extending an existing store
+with newer days without a full re-init is not built here — see "How
+'continuous' actually behaves" under Phase 2 for what this means in practice
+for training.
+
+## Phase 2: Modeling & Forecasting
+
+Two long-running background processes, both controlled and visualized from
+one web dashboard:
+
+- **Walk-forward training** (`weatherbot/train.py`, `weatherbot/model.py`) —
+  continuously steps a lightweight forecasting model forward through the
+  archive one calendar day at a time, in the same style used for financial
+  time series: on each step, score the model's prediction against a day it
+  hasn't seen yet (an honest out-of-sample error), *then* let it learn from
+  that day before moving to the next one. There's no fixed end date — once
+  it catches up to the most recent day the store has, it waits and resumes
+  automatically if the store ever grows, and otherwise just keeps running
+  until you stop it.
+- **Monte Carlo simulation** (`weatherbot/simulate.py`) — using the
+  currently-trained model, simulates many independent random future paths
+  for one location, day by day, and summarizes them into an ensemble mean
+  and percentile confidence bands (a "fan chart") rather than a single
+  deterministic forecast.
+
+### The model
+
+Rather than one heavyweight model per grid point, every `(point, variable)`
+pair — up to ~4,300 points x 18 variables ≈ 78,000 pairs at full CONUS scope
+— gets its own small linear model: two Fourier harmonics of day-of-year (the
+seasonal component) plus lag-1 and lag-7 autoregressive terms, 7 weights in
+total. Every point and variable is updated together in one vectorized numpy
+pass per calendar day — there's no per-point Python loop — which is what
+keeps this affordable on a small droplet: the full-grid model checkpoint is
+only a few MB, and one day's update is a handful of elementwise array
+operations, not a training run in the usual sense.
+
+Targets and lag features are tracked in a running-normalized space (an
+adaptive mean/std per point/variable, see `model.py` for why a naive
+first-sample estimate is unstable and what replaces it) so one global
+learning rate behaves sensibly whether the variable is temperature (°C),
+surface pressure (~1000 hPa), or precipitation (mostly 0, occasionally
+large) — without that, variables on very different scales would need
+separate tuning or would swamp each other.
+
+### How "continuous" actually behaves
+
+Training has no defined stopping condition other than the Stop button —
+that part is real. But it's still bounded by what the store actually
+contains: as noted above, a store's time extent is fixed when it's created,
+so "waiting for new data" in practice means waiting for you to run a fresh
+`fetch --mode full` that produces a store covering more days (or for
+previously-failed points to get backfilled into the *same* range by a
+resumed pull). The dashboard's status line makes the current phase explicit
+(`catching_up` vs. `live_wait`) so this is never ambiguous while it's
+running.
+
+Progress is checkpointed to `<store_path>.model.npz` (the weights and all
+running statistics) and `<store_path>.train_state.json` (current position)
+— every ~200 days during backlog catch-up, and every day once caught up to
+live polling (trivial overhead at that point). A restart — crash, `Stop`,
+`systemctl restart`, a reboot — resumes from the last checkpoint instead of
+re-walking from 1990. A `<store_path>.train.lock` file stops two training
+processes from ever running against the same store at once (e.g. the
+headless `train` CLI started alongside the dashboard by accident); delete it
+by hand only if you're sure the process that made it is actually gone.
+
+The per-day error log (`<store_path>.train_metrics.jsonl`, what feeds the
+training chart) is capped at 10,000 rows — once it grows past that, every
+other row is dropped, so recent history stays dense and old history gets
+progressively coarser instead of the file growing without bound over years
+of continuous operation.
+
+### Monte Carlo simulation
+
+Each simulated path starts from the model's current lag state at the chosen
+point, then for each forecast day: predict (seasonal + lag terms), add
+Gaussian noise sized to that point/variable's own tracked residual variance,
+and feed the noisy result back in as next day's lag-1. Paths diverge from
+each other over the horizon this way — uncertainty compounds the further out
+the forecast goes, rather than every path just being the same central
+forecast with independent per-day noise. At the end, each forecast day's
+values across all paths are summarized into percentiles (5/25/50/75/95) for
+the confidence-band chart.
+
+This is deliberately a small, on-demand computation — one point, up to 500
+paths, up to a 60-day horizon (both capped in `simulate.py` for this
+reason) — not something run across the whole grid, so it stays cheap enough
+to re-run interactively from the dashboard on a small droplet.
+
+### The dashboard
+
+```bash
+.venv\Scripts\python.exe -m weatherbot serve --store data/weather_archive.zarr
+```
+
+Opens on `http://127.0.0.1:8000` by default (`--host`/`--port` to change).
+Two panels:
+
+- **Walk-forward training** — Start/Stop buttons, current phase/date/
+  progress, and a live chart of MAE/RMSE as the model steps through history
+  (or waits for more of it).
+- **Monte Carlo simulation** — pick a location (grid point ID, or nearest to
+  a typed latitude/longitude), variable(s), horizon, and ensemble size, then
+  Start/Stop; a spaghetti plot of individual paths fills in day by day as
+  they're generated, alongside a confidence-band chart building up the same
+  way.
+
+Both processes run as background threads inside the dashboard server itself
+— stopping either just sets a flag the corresponding loop checks between
+steps (between one day of training, or one forecast day of simulation), so
+it always finishes its current step and checkpoints/exits cleanly rather
+than being killed mid-write. The dashboard polls its own small status
+endpoints roughly once a second rather than using websockets/SSE — simpler
+to run correctly on Flask's built-in server, and indistinguishable from
+"live" at that update rate.
+
+For headless training with no web UI (e.g. a minimal droplet, or debugging):
+
+```bash
+.venv\Scripts\python.exe -m weatherbot train --store data/weather_archive.zarr
+```
+
+Ctrl-C (or `systemctl stop`, which sends the same signal the service unit
+below relies on) stops it the same clean way as the dashboard's Stop button.
+Don't run this alongside the dashboard against the same store — the lock
+file will refuse the second one.
+
+### Resource footprint (why this fits a small droplet)
+
+At the current CONUS/0.5° scope (~4,300 points, 1990-present, 18 variables):
+
+- **Model checkpoint**: ~10MB uncompressed (weights + running stats + lag
+  history for every point/variable pair), compressed on disk via
+  `np.savez_compressed`.
+- **Training memory**: backlog catch-up reads the store in ~3-month blocks
+  (`BLOCK_DAYS` in `train.py`) rather than the whole 36-year history at
+  once — roughly 25-30MB resident at a time, freed after each block. Live
+  polling once caught up reads a single day at a time (negligible).
+  Lower `BLOCK_DAYS` on a very small droplet to trade I/O efficiency for an
+  even smaller peak.
+- **Training CPU**: one day's update is a handful of vectorized numpy
+  operations over ~78,000 (point, variable) pairs — a few million floating
+  point ops. Catching up through the full 1990-present backlog is expected
+  to take low single-digit minutes of CPU time on a small droplet, most of
+  it spent decompressing zarr chunks rather than computing.
+- **Monte Carlo memory/CPU**: one point, capped at 500 paths x 60 days x
+  however many variables you pick — a few hundred KB and well under a
+  second of compute, regardless of grid size, since it only ever touches
+  one point's model state.
+
+### Deploying the dashboard on a droplet
+
+`weatherbot-dashboard.service` mirrors `weatherbot.service` (see "Running
+full pull on a droplet" above) — edit `YOUR_USERNAME` and the paths, then:
+
+```bash
+sudo cp weatherbot-dashboard.service /etc/systemd/system/weatherbot-dashboard.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now weatherbot-dashboard
+```
+
+**The dashboard has no authentication or HTTPS** — its Start/Stop controls
+are not something to expose directly to the public internet. If you bind it
+to `0.0.0.0` so it's reachable from outside the droplet, put it behind a
+firewall rule limited to your own IP, or better, leave it bound to
+`127.0.0.1` (the default) and reach it through an SSH tunnel instead:
+
+```bash
+ssh -L 8000:localhost:8000 your_user@droplet_ip
+```
+
+then open `http://localhost:8000` locally, same as if it were running on
+your own machine.

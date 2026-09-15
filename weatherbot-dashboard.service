@@ -1,0 +1,24 @@
+[Unit]
+Description=WeatherBot training + forecast dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# EDIT these two to match where you cloned/copied the repo and the user
+# that owns it (your normal login user is fine for a personal droplet).
+User=YOUR_USERNAME
+WorkingDirectory=/home/YOUR_USERNAME/weatherbot
+ExecStart=/home/YOUR_USERNAME/weatherbot/.venv/bin/python -m weatherbot serve --host 0.0.0.0 --port 8000
+
+# Walk-forward training is only started when someone clicks "Start
+# training" in the dashboard (see README "Modeling & forecasting") -- it
+# is not auto-started by this service. Training checkpoints its position
+# and model weights periodically, so a restart -- crash, OOM kill, reboot
+# -- resumes from the last checkpoint instead of re-walking from 1990,
+# the same resumability the ingestion pipeline already relies on.
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

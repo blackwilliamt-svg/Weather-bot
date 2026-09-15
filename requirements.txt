@@ -7,3 +7,4 @@ numcodecs
 dask[array]
 global-land-mask
 tqdm
+flask

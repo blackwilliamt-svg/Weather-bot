@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WeatherBot — Training &amp; Forecast Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #0f1420; --panel: #171e2e; --panel-2: #1e2740; --border: #2a3450;
+    --text: #e7ebf5; --muted: #93a0c0; --accent: #4f8cff; --good: #3ddc84; --bad: #ff6b6b; --warn: #ffb454;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.45 -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+    padding: 24px; max-width: 1280px; margin: 0 auto;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  h2 { font-size: 16px; margin: 0 0 12px; }
+  .subtitle { color: var(--muted); margin: 0 0 24px; font-size: 13px; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 18px 20px; margin-bottom: 20px;
+  }
+  .row { display: flex; gap: 20px; flex-wrap: wrap; align-items: flex-start; }
+  .col { flex: 1 1 320px; min-width: 280px; }
+  .controls { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 14px; }
+  button {
+    background: var(--accent); color: #fff; border: none; border-radius: 6px;
+    padding: 9px 16px; font-size: 13px; font-weight: 600; cursor: pointer;
+  }
+  button.stop { background: var(--bad); }
+  button:disabled { background: #3a4360; color: var(--muted); cursor: not-allowed; }
+  .status-line { font-size: 13px; color: var(--muted); margin-bottom: 10px; }
+  .status-line b { color: var(--text); }
+  .badge {
+    display: inline-block; padding: 2px 9px; border-radius: 20px; font-size: 11px;
+    font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+  }
+  .badge.catching_up { background: #33406b; color: #a9c1ff; }
+  .badge.live_wait { background: #1e4a34; color: var(--good); }
+  .badge.stopped { background: #4a3520; color: var(--warn); }
+  .badge.idle { background: #2a3450; color: var(--muted); }
+  .badge.error { background: #4a1e1e; color: var(--bad); }
+  .warning { background: #4a3520; color: var(--warn); padding: 8px 12px; border-radius: 6px; font-size: 12.5px; margin-bottom: 12px; }
+  .error-box { background: #4a1e1e; color: var(--bad); padding: 8px 12px; border-radius: 6px; font-size: 12.5px; margin-bottom: 12px; }
+  label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  input, select {
+    background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
+    border-radius: 5px; padding: 7px 9px; font-size: 13px; width: 100%;
+  }
+  .field { margin-bottom: 12px; }
+  .var-list { max-height: 160px; overflow-y: auto; background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; }
+  .var-list label { display: flex; align-items: center; gap: 7px; color: var(--text); font-size: 12.5px; margin-bottom: 5px; }
+  .var-list input { width: auto; }
+  canvas { max-height: 320px; }
+  .footer-note { color: var(--muted); font-size: 11.5px; margin-top: 4px; }
+  .stat-grid { display: flex; gap: 22px; margin-bottom: 14px; flex-wrap: wrap; }
+  .stat { min-width: 90px; }
+  .stat .v { font-size: 20px; font-weight: 700; }
+  .stat .l { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .03em; }
+</style>
+</head>
+<body>
+
+<h1>WeatherBot — Training &amp; Forecast Dashboard</h1>
+<p class="subtitle">
+  {{ n_points }} grid points &middot; {{ variables|length }} variables &middot; store data {{ time_min }} .. {{ time_max }}
+  &middot; <code>{{ store_path }}</code>
+</p>
+
+<div class="panel">
+  <h2>Walk-forward training <span id="train-badge" class="badge idle">idle</span></h2>
+  <div class="controls">
+    <button id="train-start">Start training</button>
+    <button id="train-stop" class="stop">Stop</button>
+  </div>
+  <div class="status-line" id="train-status">Loading status...</div>
+  <div class="stat-grid">
+    <div class="stat"><div class="v" id="train-mae">—</div><div class="l">Latest MAE</div></div>
+    <div class="stat"><div class="v" id="train-rmse">—</div><div class="l">Latest RMSE</div></div>
+    <div class="stat"><div class="v" id="train-progress">—</div><div class="l">Days processed</div></div>
+  </div>
+  <canvas id="train-chart" height="90"></canvas>
+  <p class="footer-note">
+    Error is the model's out-of-sample MAE/RMSE (physical units, averaged across all points and variables) on
+    each day, measured <em>before</em> that day is used to update the model — this is the walk-forward part:
+    score on the next unseen day, then learn from it, then move forward. Training has no fixed end date; once it
+    reaches the most recent day in the store it waits and resumes automatically if more data appears. Chart is
+    downsampled for display when the history is long.
+  </p>
+</div>
+
+<div class="panel">
+  <h2>Monte Carlo forecast simulation <span id="sim-badge" class="badge idle">idle</span></h2>
+  <div class="row">
+    <div class="col">
+      <div class="field">
+        <label>Location — point ID (0..{{ n_points - 1 }})</label>
+        <input id="sim-point-id" type="number" min="0" max="{{ n_points - 1 }}" placeholder="e.g. 120">
+      </div>
+      <div class="field">
+        <label>...or nearest to latitude / longitude</label>
+        <div style="display:flex; gap:8px;">
+          <input id="sim-lat" type="number" step="0.01" placeholder="lat, e.g. 39.5">
+          <input id="sim-lon" type="number" step="0.01" placeholder="lon, e.g. -98.4">
+        </div>
+      </div>
+      <div class="field">
+        <label>Horizon (days, max {{ max_horizon }})</label>
+        <input id="sim-horizon" type="number" min="1" max="{{ max_horizon }}" value="{{ default_horizon }}">
+      </div>
+      <div class="field">
+        <label>Ensemble paths (max {{ max_paths }})</label>
+        <input id="sim-paths" type="number" min="1" max="{{ max_paths }}" value="{{ default_paths }}">
+      </div>
+    </div>
+    <div class="col">
+      <label>Variables to forecast</label>
+      <div class="var-list" id="sim-var-list">
+        {% for v in variables %}
+        <label><input type="checkbox" value="{{ v }}" {% if v in ("temperature_2m_mean", "precipitation_sum") %}checked{% endif %}> {{ v }}</label>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+  <div class="controls" style="margin-top: 14px;">
+    <button id="sim-start">Run simulation</button>
+    <button id="sim-stop" class="stop">Stop</button>
+    <select id="sim-chart-var" style="width: auto;"></select>
+  </div>
+  <div id="sim-warning"></div>
+  <div id="sim-error"></div>
+  <div class="status-line" id="sim-status">Pick a location and variable(s), then run a simulation.</div>
+  <div class="row">
+    <div class="col">
+      <h2 style="font-size:13px;">Ensemble paths (building up live)</h2>
+      <canvas id="sim-paths-chart" height="220"></canvas>
+    </div>
+    <div class="col">
+      <h2 style="font-size:13px;">Confidence bands (5–95% and 25–75%)</h2>
+      <canvas id="sim-band-chart" height="220"></canvas>
+    </div>
+  </div>
+  <p class="footer-note">
+    Each path starts from the model's current state at this point and is simulated forward day by day, adding
+    random noise scaled to the model's own tracked forecast-error variance at each step — so paths diverge more
+    over a longer horizon, the same way real forecast uncertainty compounds. Bands are ensemble percentiles at
+    each forecast day, not a single deterministic prediction.
+  </p>
+</div>
+
+<script>
+const STORE_VARS = {{ variables|tojson }};
+
+// ---------- shared chart helpers ----------
+function makeLineChart(ctx, opts) {
+  return new Chart(ctx, {
+    type: 'line',
+    data: { labels: [], datasets: opts.datasets },
+    options: Object.assign({
+      responsive: true, animation: false, interaction: { mode: 'index', intersect: false },
+      scales: {
+        x: { ticks: { color: '#93a0c0', maxTicksLimit: 10 }, grid: { color: '#2a3450' } },
+        y: { ticks: { color: '#93a0c0' }, grid: { color: '#2a3450' } },
+      },
+      plugins: { legend: { labels: { color: '#e7ebf5', boxWidth: 12 } } },
+    }, opts.options || {}),
+  });
+}
+
+// ---------- walk-forward training panel ----------
+const trainChart = makeLineChart(document.getElementById('train-chart').getContext('2d'), {
+  datasets: [
+    { label: 'MAE', data: [], borderColor: '#4f8cff', backgroundColor: 'transparent', pointRadius: 0, borderWidth: 1.5 },
+    { label: 'RMSE', data: [], borderColor: '#ff9f4f', backgroundColor: 'transparent', pointRadius: 0, borderWidth: 1.5 },
+  ],
+});
+
+let trainMetricsLoaded = false;
+
+function setBadge(el, phase) {
+  el.className = 'badge ' + (phase || 'idle');
+  el.textContent = (phase || 'idle').replace('_', ' ');
+}
+
+async function loadTrainMetricsOnce() {
+  if (trainMetricsLoaded) return;
+  trainMetricsLoaded = true;
+  const res = await fetch('/api/training/metrics?limit=1500');
+  const rows = await res.json();
+  trainChart.data.labels = rows.map(r => r.date);
+  trainChart.data.datasets[0].data = rows.map(r => r.mae);
+  trainChart.data.datasets[1].data = rows.map(r => r.rmse);
+  trainChart.update();
+}
+
+async function pollTraining() {
+  const res = await fetch('/api/training/status');
+  const s = await res.json();
+  setBadge(document.getElementById('train-badge'), s.phase);
+  document.getElementById('train-status').innerHTML =
+    `<b>${s.current_date || '—'}</b> — ${s.message || ''}`;
+  document.getElementById('train-progress').textContent =
+    s.total_days_known ? `${(s.days_processed_total||0).toLocaleString()} / ${s.total_days_known.toLocaleString()}` : '—';
+  if (s.latest_metrics) {
+    document.getElementById('train-mae').textContent = s.latest_metrics.mae != null ? s.latest_metrics.mae.toFixed(3) : '—';
+    document.getElementById('train-rmse').textContent = s.latest_metrics.rmse != null ? s.latest_metrics.rmse.toFixed(3) : '—';
+    if (s.current_date) {
+      const labels = trainChart.data.labels;
+      if (labels[labels.length - 1] !== s.current_date) {
+        labels.push(s.current_date);
+        trainChart.data.datasets[0].data.push(s.latest_metrics.mae);
+        trainChart.data.datasets[1].data.push(s.latest_metrics.rmse);
+        if (labels.length > 2000) { labels.shift(); trainChart.data.datasets[0].data.shift(); trainChart.data.datasets[1].data.shift(); }
+        trainChart.update('none');
+      }
+    }
+  }
+  document.getElementById('train-start').disabled = !!s.running;
+  document.getElementById('train-stop').disabled = !s.running;
+}
+
+document.getElementById('train-start').addEventListener('click', async () => {
+  const res = await fetch('/api/training/start', { method: 'POST' });
+  if (!res.ok) { const e = await res.json(); alert(e.error || 'Could not start training.'); }
+  pollTraining();
+});
+document.getElementById('train-stop').addEventListener('click', async () => {
+  await fetch('/api/training/stop', { method: 'POST' });
+  pollTraining();
+});
+
+loadTrainMetricsOnce();
+setInterval(pollTraining, 1000);
+pollTraining();
+
+// ---------- monte carlo panel ----------
+let simSince = 0;
+let simSelectedVars = [];
+let simChartVar = null;
+const pathColors = idx => `hsla(${(idx * 47) % 360}, 70%, 65%, 0.18)`;
+
+const pathsChart = makeLineChart(document.getElementById('sim-paths-chart').getContext('2d'), {
+  datasets: [], options: { plugins: { legend: { display: false } } },
+});
+const bandChart = makeLineChart(document.getElementById('sim-band-chart').getContext('2d'), {
+  datasets: [
+    { label: 'p5–p95', data: [], borderColor: 'transparent', backgroundColor: 'rgba(79,140,255,0.12)', pointRadius: 0, fill: '+1' },
+    { label: 'p95', data: [], borderColor: 'transparent', backgroundColor: 'transparent', pointRadius: 0, fill: false },
+    { label: 'p25–p75', data: [], borderColor: 'transparent', backgroundColor: 'rgba(79,140,255,0.28)', pointRadius: 0, fill: '+1' },
+    { label: 'p75', data: [], borderColor: 'transparent', backgroundColor: 'transparent', pointRadius: 0, fill: false },
+    { label: 'median', data: [], borderColor: '#4f8cff', backgroundColor: 'transparent', pointRadius: 0, borderWidth: 2, fill: false },
+  ],
+});
+
+function resetSimCharts(vars) {
+  simChartVar = vars[0] || null;
+  const sel = document.getElementById('sim-chart-var');
+  sel.innerHTML = vars.map(v => `<option value="${v}">${v}</option>`).join('');
+  pathsChart.data.labels = []; pathsChart.data.datasets = [];
+  bandChart.data.labels = [];
+  bandChart.data.datasets.forEach(d => d.data = []);
+  pathsChart.update(); bandChart.update();
+}
+
+document.getElementById('sim-chart-var').addEventListener('change', e => {
+  simChartVar = e.target.value;
+});
+
+function applyFrame(frame) {
+  if (!frame.paths[simChartVar]) return;
+  const label = frame.date;
+  pathsChart.data.labels.push(label);
+  const values = frame.paths[simChartVar];
+  if (pathsChart.data.datasets.length === 0) {
+    values.forEach((_, i) => pathsChart.data.datasets.push({
+      data: [], borderColor: pathColors(i), backgroundColor: 'transparent', pointRadius: 0, borderWidth: 1,
+    }));
+  }
+  values.forEach((v, i) => { if (pathsChart.data.datasets[i]) pathsChart.data.datasets[i].data.push(v); });
+
+  const pct = frame.percentiles[simChartVar];
+  bandChart.data.labels.push(label);
+  bandChart.data.datasets[0].data.push(pct['5']);
+  bandChart.data.datasets[1].data.push(pct['95']);
+  bandChart.data.datasets[2].data.push(pct['25']);
+  bandChart.data.datasets[3].data.push(pct['75']);
+  bandChart.data.datasets[4].data.push(pct['50']);
+}
+
+async function pollSimulation() {
+  const res = await fetch(`/api/simulate/status?since=${simSince}`);
+  const s = await res.json();
+  setBadge(document.getElementById('sim-badge'), s.running ? 'catching_up' : (s.done ? 'live_wait' : 'idle'));
+  document.getElementById('sim-start').disabled = !!s.running;
+  document.getElementById('sim-stop').disabled = !s.running;
+
+  const warnEl = document.getElementById('sim-warning');
+  warnEl.innerHTML = s.meta && s.meta.warning ? `<div class="warning">${s.meta.warning}</div>` : '';
+  const errEl = document.getElementById('sim-error');
+  errEl.innerHTML = s.error ? `<div class="error-box">${s.error}</div>` : '';
+
+  if (s.meta && s.meta.point) {
+    document.getElementById('sim-status').innerHTML =
+      `Point ${s.meta.point.point_id} (${s.meta.point.lat.toFixed(2)}, ${s.meta.point.lon.toFixed(2)}) — ` +
+      `${s.total_frames}/${s.meta.horizon_days} day(s), ${s.meta.n_paths} paths` +
+      (s.done ? ' — done.' : ' — simulating...');
+  }
+
+  for (const frame of s.frames) { applyFrame(frame); simSince++; }
+  if (s.frames.length) { pathsChart.update('none'); bandChart.update('none'); }
+}
+
+document.getElementById('sim-start').addEventListener('click', async () => {
+  const checked = Array.from(document.querySelectorAll('#sim-var-list input:checked')).map(el => el.value);
+  if (!checked.length) { alert('Pick at least one variable.'); return; }
+  const pointIdRaw = document.getElementById('sim-point-id').value;
+  const lat = document.getElementById('sim-lat').value;
+  const lon = document.getElementById('sim-lon').value;
+  const body = {
+    variables: checked,
+    horizon_days: parseInt(document.getElementById('sim-horizon').value, 10),
+    n_paths: parseInt(document.getElementById('sim-paths').value, 10),
+  };
+  if (pointIdRaw !== '') body.point_id = parseInt(pointIdRaw, 10);
+  else if (lat !== '' && lon !== '') { body.lat = parseFloat(lat); body.lon = parseFloat(lon); }
+  else { alert('Enter a point ID, or both latitude and longitude.'); return; }
+
+  resetSimCharts(checked);
+  simSince = 0;
+  const res = await fetch('/api/simulate/start', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+  if (!res.ok) { const e = await res.json(); alert(e.error || 'Could not start simulation.'); }
+  pollSimulation();
+});
+document.getElementById('sim-stop').addEventListener('click', async () => {
+  await fetch('/api/simulate/stop', { method: 'POST' });
+  pollSimulation();
+});
+
+setInterval(pollSimulation, 800);
+pollSimulation();
+</script>
+</body>
+</html>
