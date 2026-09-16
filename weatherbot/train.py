@@ -11,7 +11,7 @@ exactly the "expanding window" validation style used for financial time
 series, just applied to grid points and weather variables instead of
 tickers and returns.
 
-Historical backlog is read from the store in multi-month blocks (a
+Historical backlog is read from the store in multi-week blocks (a
 double-digit number of MB at a time) rather than one xarray call per day,
 to keep I/O reasonable on a small droplet. Once the walk reaches the most
 recent day the store actually has, it switches to a slow poll loop and
@@ -46,7 +46,15 @@ from .model import OnlineModel
 
 log = logging.getLogger(__name__)
 
-BLOCK_DAYS = 90  # backlog is read from the store in ~3-month chunks (~25-30MB each at full CONUS scope)
+# Backlog is read from the store this many days at a time. Sized against
+# the CURRENT grid scope (~17,000 CONUS points x 18 variables at 0.25deg
+# spacing): 21 days x ~17,300 points x 18 vars x 4 bytes (float32) is
+# ~25MB resident at a time, freed after each block -- the same target this
+# was originally sized to at the previous (0.5deg, ~4,300-point) scope, just
+# with a shorter block since there are ~4x as many points now. If the grid
+# ever changes again, rescale this so n_points * BLOCK_DAYS stays roughly
+# constant (~360,000) to hold peak memory steady on a small droplet.
+BLOCK_DAYS = 21
 CHECKPOINT_EVERY_STEPS = 200  # during backlog catch-up; live mode checkpoints every step (cheap, ~1/day)
 LIVE_POLL_INTERVAL_SEC = 300  # how often to re-check the store for new data once caught up
 METRICS_MAX_ROWS = 10_000  # bound the on-disk metrics log for a process meant to run forever

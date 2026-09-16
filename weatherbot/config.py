@@ -35,11 +35,9 @@ OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 
 # Land-focused bounding box (lat_min, lat_max, lon_min, lon_max): the
 # contiguous United States (CONUS) only — Alaska, Hawaii, and the rest of
-# North America (Canada, Mexico, Central America) are out of scope. This is
-# a reduced-scope config (confirmed with the user): a coarser 0.5 deg
-# (~55km) grid over a much smaller area than the old central/eastern North
-# America box, so both point count and storage footprint shrink accordingly.
-# Widening the box or tightening the spacing is a config change away.
+# North America (Canada, Mexico, Central America) are out of scope. Widening
+# the box is a config change away, at the cost of proportionally more points
+# and storage.
 CONUS_BBOX = (24.0, 50.0, -125.0, -66.5)
 
 ARCHIVE_START_DATE = _dt.date(1990, 1, 1)
@@ -58,14 +56,24 @@ DEFAULT_FULL_STORE_PATH = "data/weather_archive.zarr"
 class Config:
     # Grid
     bbox: tuple[float, float, float, float] = CONUS_BBOX
-    spacing_deg: float = 0.5
+    spacing_deg: float = 0.25  # ~22-28km spacing -- roughly 16,000-17,000 CONUS land points
 
     # Zarr layout. run_test_mode/run_full_mode callers (CLI, GUI) resolve this
     # to DEFAULT_TEST_STORE_PATH / DEFAULT_FULL_STORE_PATH when not overridden.
     store_path: str = DEFAULT_FULL_STORE_PATH
     point_chunk: int = 50
     time_chunk_days: int = 365
-    zstd_level: int = 12
+    # 22 is zstd's max ("--ultra") level -- minimizes the archive's footprint
+    # on disk at the cost of slower compression during ingestion. Safe on a
+    # small droplet's RAM despite the "ultra" levels' reputation for heavier
+    # compression memory: that extra cost scales with the *input* size zstd
+    # is asked to compress in one shot, and each zarr chunk here is tiny
+    # (point_chunk x time_chunk_days floats, well under 100KB) regardless of
+    # how large the overall archive gets -- see README "Storage format" for
+    # the measurement that confirms this. Independently overridable via
+    # --zstd-level if a faster-to-write/decompress level is ever wanted for
+    # a specific store (e.g. a live-serving copy).
+    zstd_level: int = 22
 
     # Fetch behavior.
     # Open-Meteo's free/keyless tier rejects large requests outright ("too much

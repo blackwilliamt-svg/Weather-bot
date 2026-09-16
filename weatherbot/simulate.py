@@ -48,7 +48,7 @@ class SimFrame:
 
 def nearest_point_idx(lats: np.ndarray, lons: np.ndarray, lat: float, lon: float) -> int:
     """Nearest grid point by simple planar distance -- adequate for
-    picking among points on a 0.5-degree CONUS grid, not meant for precise
+    picking among points on a 0.25-degree CONUS grid, not meant for precise
     geodesy."""
     d2 = (lats - lat) ** 2 + (lons - lon) ** 2
     return int(np.argmin(d2))

@@ -27,8 +27,8 @@ Double-click **`WeatherBot.bat`**. A window opens with four buttons:
 - **Run Test Pull** — 20 grid points, last 10 years of data. Finishes in a
   couple of minutes; use this to confirm everything works before committing
   to the full pull. Writes to `data/weather_test.zarr`.
-- **Run Full Pull** — the real archive: ~4,300 land grid points across the
-  contiguous United States, 1990-present, roughly 1.3-2.1GB compressed. The
+- **Run Full Pull** — the real archive: ~17,300 land grid points across the
+  contiguous United States, 1990-present, roughly 5.2-7.8GB compressed. The
   app shows an exact estimate (points/days/requests/size/best-case time)
   before you confirm — see "Fetch performance" below for what actually
   governs how long it takes. Leave the computer on and connected to the
@@ -69,8 +69,8 @@ Grid density, chunking, batching, pacing, and concurrency are all configurable
 rather than hardcoded:
 
 ```bash
-.venv\Scripts\python.exe -m weatherbot fetch --mode full --spacing-deg 0.5 \
-    --point-chunk 50 --time-chunk-days 365 --zstd-level 12 \
+.venv\Scripts\python.exe -m weatherbot fetch --mode full --spacing-deg 0.25 \
+    --point-chunk 50 --time-chunk-days 365 --zstd-level 22 \
     --batch-size 20 --time-chunk-years 3 --full-pull-interval-sec 9
 ```
 
@@ -81,12 +81,12 @@ paces at `--full-pull-interval-sec`, sequentially. See "Fetch performance".)
 
 Open-Meteo's free/keyless tier has three request-volume caps: 600/minute,
 5,000/hour, and 10,000/day. For a one-off small pull, the minute/hour caps
-are what you'd notice. For the **full pull specifically** — thousands of
-requests, comfortably finishing within a day at this reduced scope — the
-**daily** cap is still the one that actually governs total completion time:
-bursting up to the minute/hour limits just hits the daily one sooner and
-then sits idle until it resets, it doesn't finish any sooner overall. So
-full pull and test mode are paced differently on purpose:
+are what you'd notice. For the **full pull specifically** — over 11,000
+requests, running a bit past a single day at this scope — the **daily** cap
+is the one that actually governs total completion time: bursting up to the
+minute/hour limits just hits the daily one sooner and then sits idle until
+it resets, it doesn't finish any sooner overall. So full pull and test mode
+are paced differently on purpose:
 
 - **Full pull mode: fixed, sequential pacing.** One batched request every
   `--full-pull-interval-sec` (default 9s — 86,400s/day ÷ 10,000 requests =
@@ -104,10 +104,10 @@ full pull and test mode are paced differently on purpose:
   "location-years per request". Empirically, 15 locations x 10 years (150
   location-years) gets rejected outright while 3 x 10 (30) succeeds; the
   defaults (20 x 3 = 60) sit with margin on both sides, found by testing
-  against the live API, not guessed. At the current CONUS/0.5° scope
-  (~4,300 points, 1990-present) that keeps full pull's request count to
-  ~2,850 (vs. ~8,300 at a naive 10x2 batching) — at the fixed 9s pace,
-  that's the difference between a ~7-hour run and a ~21-hour one.
+  against the live API, not guessed. At the current CONUS/0.25° scope
+  (~17,300 points, 1990-present) that keeps full pull's request count to
+  ~11,300 (vs. ~32,900 at a naive 10x2 batching) — at the fixed 9s pace,
+  that's the difference between a ~28-hour run and a ~3.4-day one.
 - **Test mode** stays fast and adaptive — several batches at once
   (`--concurrency`, default 4) with a rate limiter that starts fast and only
   backs off after an actual 429 (shared across workers, so one worker's 429
@@ -126,17 +126,17 @@ pacing, but is handled if it does) doesn't retry in a loop or get recorded
 as a failure — the run stops cleanly and is fully resumable once the budget
 resets, exactly like the Stop button (see "Interruptions and resuming").
 
-At the fixed full-pull pace, the app's upfront estimate (~7 hours at
-current defaults) is the actual expected duration, not just a best case —
-verify it against the live ETA once you start a run.
+At the fixed full-pull pace, the app's upfront estimate (~28 hours, a bit
+over a day, at current defaults) is the actual expected duration, not just
+a best case — verify it against the live ETA once you start a run.
 
 ## Running full pull on a droplet
 
-A ~7-hour continuous run is short enough to just leave a Windows machine on
-for, but if you'd rather not tie up a machine you need to use/sleep/reboot,
-full pull mode is plain CLI — no GUI dependency at all — so it also runs
-fine headless on a small Linux droplet; test mode stays a local Windows GUI
-run as before, this section is full pull only.
+A ~28-hour continuous run is a bit long to tie up a Windows machine you need
+to use/sleep/reboot during that window. Full pull mode is plain CLI — no GUI
+dependency at all — so it runs fine headless on a small Linux droplet
+instead; test mode stays a local Windows GUI run as before, this section is
+full pull only.
 
 ### One-time droplet setup
 
@@ -157,7 +157,7 @@ platform-specific.
 
 A plain `nohup ... &` survives your SSH session ending, but not a droplet
 reboot. Since this is checkpointed (see "Interruptions and resuming") and
-expected to run for several hours, a **systemd service** is the more robust
+expected to run for about a day, a **systemd service** is the more robust
 choice — it restarts automatically on a crash or reboot, with no one needing
 to notice and re-launch it:
 
@@ -194,10 +194,11 @@ droplet won't restart during the run.
 
 ### Disk space — read this before starting
 
-The estimated compressed store size is **~1.3-2.1GB**, comfortably inside a
-default **~25GB** droplet SSD even with the OS/Python/venv already on it. A
-separate DigitalOcean **Volume** is no longer necessary at this scope, but
-if you're running on a smaller droplet than that, either:
+The estimated compressed store size is **~5.2-7.8GB** (max-level zstd
+compression, see "Storage format" below) — still comfortably inside a
+default **~25GB** droplet SSD alongside the OS/Python/venv, but with a
+narrower margin than a smaller archive would leave. If you're on a smaller
+droplet than that, or want more headroom, either:
 
 - Attach a separate DigitalOcean **Volume** (block storage) and point
   `--store` at a path on it, so the store doesn't compete with the boot
@@ -240,11 +241,13 @@ remote path and it handles resuming an interrupted transfer on its own.
 ## Geographic coverage
 
 The grid covers only the contiguous United States (CONUS) — roughly
-24-50°N, 125-66.5°W — at 0.5° (~55km) spacing, land points only. Alaska,
-Hawaii, and the rest of North America (Canada, Mexico, Central America) are
-explicitly out of scope for this reduced-scope build; the bounding box is a
-plain constant (`CONUS_BBOX` in `config.py`), so widening it is a one-line
-change if you'd rather have broader coverage at the cost of a larger store.
+24-50°N, 125-66.5°W — at 0.25° (~22-28km) spacing, land points only, ~17,300
+points. Alaska, Hawaii, and the rest of North America (Canada, Mexico,
+Central America) are explicitly out of scope for this reduced-scope build;
+the bounding box is a plain constant (`CONUS_BBOX` in `config.py`), so
+widening it is a one-line change if you'd rather have broader coverage at
+the cost of a larger store, and `--spacing-deg` is a CLI override if you'd
+rather go finer or coarser than 0.25° without touching the bounding box.
 
 ## Storage format
 
@@ -252,11 +255,23 @@ change if you'd rather have broader coverage at the cost of a larger store.
   land-filtered grid (sorted by lat, then lon); `lat`/`lon` are coordinates
   indexed by `point`. `time` is a daily `datetime64` index from 1990-01-01.
 - All data variables are `float32`, compressed with `numcodecs.Zstd` at a
-  configurable "mid" level (default 12; range 1-22) — lossless beyond the
-  float32 downcast itself.
+  configurable level (default 22, zstd's max/"ultra" level — full pull
+  prioritizes minimizing the archive's footprint on the droplet over
+  compression/decompression speed; range 1-22) — lossless beyond the
+  float32 downcast itself, at any level.
 - Chunked by point (default 50) and by ~1 year of days (default 365),
   configurable — sized for a ~512MB RAM serving target on the eventual
-  droplet this store gets shipped to.
+  droplet this store gets shipped to. That target is about decompressing
+  and reading chunks back, not about writing them: each chunk is small
+  regardless of level (well under 100KB per point/variable/year at this
+  chunking), so zstd's "ultra" levels — which have a reputation for needing
+  meaningfully more memory on *large* inputs — cost only a few KB of extra
+  compression-context memory here, confirmed by direct measurement
+  (`zstandard.ZstdCompressor.memory_size()`) rather than assumed; the actual
+  cost of level 22 is slower compression per chunk (single-digit
+  milliseconds, vs. fractions of a millisecond at level 12), which adds up
+  to low tens of minutes across the whole archive — negligible next to a
+  multi-day, network-paced full pull.
 - Fetched data is downcast and written straight into the compressed store —
   there's no uncompressed intermediate file at any point.
 
@@ -324,8 +339,8 @@ one web dashboard:
 ### The model
 
 Rather than one heavyweight model per grid point, every `(point, variable)`
-pair — up to ~4,300 points x 18 variables ≈ 78,000 pairs at full CONUS scope
-— gets its own small linear model: two Fourier harmonics of day-of-year (the
+pair — ~17,300 points x 18 variables ≈ 311,600 pairs at full CONUS scope —
+gets its own small linear model: two Fourier harmonics of day-of-year (the
 seasonal component) plus lag-1 and lag-7 autoregressive terms, 7 weights in
 total. Every point and variable is updated together in one vectorized numpy
 pass per calendar day — there's no per-point Python loop — which is what
@@ -426,26 +441,34 @@ file will refuse the second one.
 
 ### Resource footprint (why this fits a small droplet)
 
-At the current CONUS/0.5° scope (~4,300 points, 1990-present, 18 variables):
+At the current CONUS/0.25° scope (~17,300 points, 1990-present, 18
+variables, ~311,600 point/variable pairs — roughly 4x the pairs a 0.5°
+grid had):
 
-- **Model checkpoint**: ~10MB uncompressed (weights + running stats + lag
-  history for every point/variable pair), compressed on disk via
-  `np.savez_compressed`.
-- **Training memory**: backlog catch-up reads the store in ~3-month blocks
-  (`BLOCK_DAYS` in `train.py`) rather than the whole 36-year history at
-  once — roughly 25-30MB resident at a time, freed after each block. Live
-  polling once caught up reads a single day at a time (negligible).
-  Lower `BLOCK_DAYS` on a very small droplet to trade I/O efficiency for an
-  even smaller peak.
+- **Model checkpoint**: ~43MB uncompressed (weights + running stats + lag
+  history for every point/variable pair; scales linearly with pair count,
+  so ~4x the previous ~10MB), smaller on disk via `np.savez_compressed`.
+  Still trivial to read/write/checkpoint repeatedly on a small droplet.
+- **Training memory**: backlog catch-up reads the store in blocks
+  (`BLOCK_DAYS` in `train.py`, now 21 days — cut from the previous 90 so
+  that `n_points x BLOCK_DAYS` stays roughly constant as the grid got ~4x
+  denser) rather than the whole 36-year history at once — roughly 25MB
+  resident at a time, freed after each block, matching the original
+  ~25-30MB target this was sized for at the smaller grid. Live polling
+  once caught up reads a single day at a time (negligible). If the grid
+  ever changes again, rescale `BLOCK_DAYS` so `n_points x BLOCK_DAYS`
+  stays close to today's ~360,000 to hold this steady.
 - **Training CPU**: one day's update is a handful of vectorized numpy
-  operations over ~78,000 (point, variable) pairs — a few million floating
-  point ops. Catching up through the full 1990-present backlog is expected
-  to take low single-digit minutes of CPU time on a small droplet, most of
-  it spent decompressing zarr chunks rather than computing.
+  operations over ~311,600 (point, variable) pairs — roughly 4x the
+  per-day arithmetic of the previous scope, still just a few million
+  floating point ops per day. Catching up through the full 1990-present
+  backlog is expected to take single-digit minutes of CPU time on a small
+  droplet, most of it spent decompressing zarr chunks rather than
+  computing.
 - **Monte Carlo memory/CPU**: one point, capped at 500 paths x 60 days x
   however many variables you pick — a few hundred KB and well under a
-  second of compute, regardless of grid size, since it only ever touches
-  one point's model state.
+  second of compute, regardless of grid size (unaffected by the spacing
+  change), since it only ever touches one point's model state.
 
 ### Deploying the dashboard on a droplet
 
