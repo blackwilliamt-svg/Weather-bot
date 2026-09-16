@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import datetime as _dt
-import json
 import logging
 import signal
 import sys
@@ -13,31 +11,6 @@ from tqdm import tqdm
 
 from . import inventory, pipeline, train as train_module
 from .config import DEFAULT_CONFIG, DEFAULT_FULL_STORE_PATH, DEFAULT_TEST_STORE_PATH
-
-
-def _write_status_file(store_path: str, info: pipeline.ProgressInfo) -> None:
-    """Small JSON snapshot for checking progress on a headless/remote run
-    (e.g. a droplet) without needing a terminal attached to the process —
-    `cat <store_path>.status.json` or watch it with `watch -n 30 cat ...`."""
-    status = {
-        "step": info.step,
-        "total_steps": info.total_steps,
-        "percent": round(100 * info.step / info.total_steps, 2) if info.total_steps else 0,
-        "bytes_downloaded": info.bytes_downloaded,
-        "bytes_downloaded_human": pipeline.format_bytes(info.bytes_downloaded),
-        "elapsed_sec": round(info.elapsed_sec, 1),
-        "elapsed_human": pipeline.format_duration(info.elapsed_sec),
-        "eta_sec": info.eta_sec,
-        "eta_human": pipeline.format_duration(info.eta_sec),
-        "failures_so_far": info.failures_so_far,
-        "message": info.message,
-        "updated_utc": _dt.datetime.utcnow().isoformat(),
-    }
-    try:
-        with open(f"{store_path}.status.json", "w") as fh:
-            json.dump(status, fh, indent=2)
-    except OSError as exc:
-        logging.getLogger(__name__).warning("could not write status file: %s", exc)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -118,6 +91,22 @@ def main(argv: list[str] | None = None) -> int:
               f"({pipeline.format_bytes(est['raw_bytes'])} raw). "
               f"{time_label}: {pipeline.format_duration(est['min_seconds'])}.\n")
 
+        # SIGTERM (what `systemctl stop` sends) and Ctrl-C both request a
+        # stop through the same file-based mechanism the dashboard's Stop
+        # button uses (pipeline.request_stop) rather than just dying --
+        # per-batch checkpointing already makes an abrupt kill safe to
+        # resume from, but going through request_stop also releases the
+        # FetchLock's heartbeat immediately instead of waiting out its
+        # staleness window, so a restart (or the dashboard) can pick the
+        # store back up right away.
+        def _handle_signal(signum, _frame):
+            print(f"\nReceived signal {signum} -- stopping after the current batch (checkpointing)...")
+            pipeline.request_stop(config.store_path)
+
+        signal.signal(signal.SIGINT, _handle_signal)
+        if hasattr(signal, "SIGTERM"):
+            signal.signal(signal.SIGTERM, _handle_signal)
+
         with tqdm(desc="fetching", unit="batch") as pbar:
             def on_progress(info: pipeline.ProgressInfo) -> None:
                 if pbar.total != info.total_steps:
@@ -128,12 +117,19 @@ def main(argv: list[str] | None = None) -> int:
                     f"ETA {pipeline.format_duration(info.eta_sec)} | {info.message}"
                 )
                 pbar.refresh()
-                _write_status_file(config.store_path, info)
+                pipeline.write_status_file(config.store_path, info)
 
-            if args.mode == "test":
-                summary = pipeline.run_test_mode(config, on_progress=on_progress)
-            else:
-                summary = pipeline.run_full_mode(config, on_progress=on_progress)
+            try:
+                if args.mode == "test":
+                    summary = pipeline.run_test_mode(config, on_progress=on_progress)
+                else:
+                    summary = pipeline.run_full_mode(config, on_progress=on_progress)
+            except RuntimeError as exc:
+                # Most likely: FetchLock already held by another process
+                # (the systemd service, the dashboard, or a second CLI
+                # invocation) against this same store.
+                print(f"\n{exc}")
+                return 1
 
         if summary["already_complete"]:
             print(f"\nAlready complete — {summary['n_points']} points, {summary['n_batches']} "

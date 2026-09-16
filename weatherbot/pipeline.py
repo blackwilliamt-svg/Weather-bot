@@ -14,8 +14,10 @@ anything in this module that unconditionally printed would crash it.
 from __future__ import annotations
 
 import datetime as _dt
+import glob
 import json
 import logging
+import os
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -42,6 +44,108 @@ class ProgressInfo:
 
 
 ProgressCallback = Callable[[ProgressInfo], None]
+
+
+# -- cross-process coordination -------------------------------------------
+#
+# A fetch can be started three different ways against the same store: the
+# local GUI, the CLI (including the systemd-run droplet service), and now
+# the web dashboard's own "Droplet Pull" tab (webapp.py) -- and any of
+# those could be running unattended for a long time. Two small file-based
+# mechanisms keep them from stepping on each other without needing the
+# dashboard to reach across process boundaries (signals, PIDs) to a
+# process it may not have started:
+#
+# - FetchLock: mutual exclusion, so a second Start doesn't launch a
+#   competing writer against the same store while one is already running.
+# - request_stop()/stop_requested(): a cooperative halt flag any running
+#   fetch checks between batches, regardless of which process started it
+#   -- this is what lets the dashboard's Stop button halt a systemd-owned
+#   pull cleanly without ever sending it a signal directly.
+
+FETCH_LOCK_STALE_SEC = 600  # see FetchLock docstring for why 10 minutes
+
+
+def _fetch_lock_path(store_path: str) -> str:
+    return f"{store_path}.fetch.lock"
+
+
+class FetchLock:
+    """Cross-process mutual exclusion for a running fetch against one
+    store -- deliberately staleness-aware, unlike train.TrainingLock's
+    plain existence check. Fetch's whole design promise is "resumable
+    after ANY interruption, no exceptions" (crash, OOM kill, power loss,
+    `systemctl stop`), so a lock that could be left behind forever by an
+    unclean death and then require someone to find and delete a file by
+    hand would quietly break that promise. Instead, the lock file's mtime
+    is a heartbeat -- refreshed once per completed batch by run_pipeline
+    -- and the lock is only considered held while that heartbeat is
+    younger than FETCH_LOCK_STALE_SEC (10 minutes: comfortably longer than
+    the worst realistic single-batch stall under network retries/backoff,
+    short enough that a genuine crash self-heals well within a normal
+    systemd restart cycle). A stale lock is silently reclaimed by whoever
+    next calls acquire() -- exactly like resuming after any other kind of
+    interruption, no manual cleanup ever required.
+    """
+
+    def __init__(self, store_path: str):
+        self.path = _fetch_lock_path(store_path)
+        self._held = False
+
+    def acquire(self) -> None:
+        if os.path.exists(self.path):
+            age = time.time() - os.path.getmtime(self.path)
+            if age < FETCH_LOCK_STALE_SEC:
+                raise RuntimeError(
+                    f"A fetch is already running against this store (last heartbeat {age:.0f}s "
+                    "ago) -- likely the systemd service, another dashboard session, or a separate "
+                    "CLI run. Stop it first: the dashboard's Stop button (or requesting a stop "
+                    "against this store some other way) works regardless of which process started "
+                    "it, since it doesn't need to know or signal that process directly."
+                )
+            # Stale: the previous owner died without releasing it. Reclaiming it is the
+            # self-healing case this class exists for, not an error.
+            log.info("reclaiming stale fetch lock at %s (heartbeat %.0fs old)", self.path, age)
+        self.touch()
+        self._held = True
+
+    def touch(self) -> None:
+        with open(self.path, "w") as fh:
+            fh.write(str(os.getpid()))
+
+    def release(self) -> None:
+        if self._held and os.path.exists(self.path):
+            try:
+                os.remove(self.path)
+            except OSError:
+                pass
+        self._held = False
+
+
+def _stop_request_path(store_path: str) -> str:
+    return f"{store_path}.fetch_stop_request"
+
+
+def request_stop(store_path: str) -> None:
+    """Cooperative, cross-process halt signal for a running fetch against
+    this store. run_pipeline checks for this file before every batch (in
+    addition to any in-process should_stop callback), so it works whether
+    the running fetch is a dashboard-launched background thread or a
+    separate systemd/CLI process -- same clean-stop guarantee either way:
+    the current in-flight batch finishes and is checkpointed, nothing is
+    lost, and it's exactly as resumable as any other interruption."""
+    open(_stop_request_path(store_path), "w").close()
+
+
+def stop_requested(store_path: str) -> bool:
+    return os.path.exists(_stop_request_path(store_path))
+
+
+def _clear_stop_request(store_path: str) -> None:
+    try:
+        os.remove(_stop_request_path(store_path))
+    except OSError:
+        pass
 
 
 def _daily_row(daily: dict, variable: str, expected_len: int) -> np.ndarray | None:
@@ -82,15 +186,52 @@ def run_pipeline(
     fresh; see run_full_mode), already-completed batches are skipped instead
     of re-fetched, and the store is not re-initialized (which would wipe it).
 
-    should_stop(), if given, is checked before each batch — a deliberate stop
-    uses the exact same checkpoint/resume machinery as an unplanned
-    interruption: whatever's already written stays written, and a later run
-    with the same parameters picks up right where this one stopped.
+    should_stop(), if given, is checked before each batch, alongside a
+    file-based stop request any *other* process can also make (see
+    request_stop()) — either way it's a deliberate stop using the exact same
+    checkpoint/resume machinery as an unplanned interruption: whatever's
+    already written stays written, and a later run with the same parameters
+    picks up right where this one stopped.
+
+    Acquires a FetchLock for config.store_path for the duration of the run,
+    so a second run_pipeline call against the same store (from another
+    process, e.g. the dashboard vs. the systemd service) fails fast instead
+    of both writing to the store at once.
 
     on_progress(ProgressInfo), if given, is called after each fetched+written
     batch. Returns a summary dict:
     {n_points, n_batches, resumed_from, stopped, bytes_downloaded, elapsed_sec, failures: [...]}.
     """
+    lock = FetchLock(config.store_path)
+    lock.acquire()
+    try:
+        return _run_pipeline_locked(
+            config, points, start_date, end_date, years_per_time_chunk, lock, on_progress, should_stop,
+        )
+    finally:
+        lock.release()
+
+
+def _run_pipeline_locked(
+    config: Config,
+    points: pd.DataFrame,
+    start_date: _dt.date,
+    end_date: _dt.date,
+    years_per_time_chunk: int,
+    lock: "FetchLock",
+    on_progress: Optional[ProgressCallback],
+    should_stop: Optional[Callable[[], bool]],
+) -> dict:
+    # Any stop request left over from a previous run against this store
+    # (normally cleared the moment it's honored, below) shouldn't
+    # immediately halt a brand new one.
+    _clear_stop_request(config.store_path)
+
+    def _effective_should_stop() -> bool:
+        if stop_requested(config.store_path):
+            return True
+        return should_stop() if should_stop is not None else False
+
     point_batches = list(_iter_point_batches(points, config.batch_size))
     time_chunks = list(_iter_time_chunks(start_date, end_date, years_per_time_chunk))
     total_steps = len(point_batches) * len(time_chunks)
@@ -178,6 +319,7 @@ def run_pipeline(
         step = idx + 1
         store.write_manifest(config.store_path, config, grid_fp, years_per_time_chunk,
                               start_date, end_date, step)
+        lock.touch()  # refresh the heartbeat -- see FetchLock
 
         steps_done_this_session = step - resumed_from
         elapsed_sec = time.monotonic() - start_time
@@ -215,9 +357,10 @@ def run_pipeline(
 
         next_write_idx = resumed_from
         while next_write_idx < total_steps:
-            if should_stop is not None and should_stop():
+            if _effective_should_stop():
                 stopped = True
                 stop_reason = "user"
+                _clear_stop_request(config.store_path)  # honored -- don't block the next run
                 break  # in-flight futures are awaited (harmlessly) when the pool exits below
 
             batch, chunk_start, chunk_end = flat_steps[next_write_idx]
@@ -318,6 +461,74 @@ def write_failure_log(summary: dict, store_path: str) -> Optional[str]:
     with open(log_path, "w") as fh:
         json.dump(failures, fh, indent=2)
     return log_path
+
+
+def _status_path(store_path: str) -> str:
+    return f"{store_path}.status.json"
+
+
+def write_status_file(store_path: str, info: ProgressInfo) -> None:
+    """Small JSON snapshot for checking a fetch's progress without a
+    terminal attached to the process — `cat <store_path>.status.json`, or
+    the source the dashboard's "Droplet Pull" tab polls. Written by any
+    caller driving run_pipeline via its on_progress callback (the CLI
+    fetch command, and the dashboard's own background thread alike), so
+    the reading side doesn't need to know which one produced it."""
+    status = {
+        "step": info.step,
+        "total_steps": info.total_steps,
+        "percent": round(100 * info.step / info.total_steps, 2) if info.total_steps else 0,
+        "bytes_downloaded": info.bytes_downloaded,
+        "bytes_downloaded_human": format_bytes(info.bytes_downloaded),
+        "elapsed_sec": round(info.elapsed_sec, 1),
+        "elapsed_human": format_duration(info.elapsed_sec),
+        "eta_sec": info.eta_sec,
+        "eta_human": format_duration(info.eta_sec),
+        "failures_so_far": info.failures_so_far,
+        "message": info.message,
+        "updated_utc": _dt.datetime.utcnow().isoformat(),
+    }
+    try:
+        with open(_status_path(store_path), "w") as fh:
+            json.dump(status, fh, indent=2)
+    except OSError as exc:
+        log.warning("could not write status file: %s", exc)
+
+
+def read_status_file(store_path: str) -> Optional[dict]:
+    """The most recent write_status_file() snapshot, or None if a fetch
+    has never run against this store (this session or otherwise)."""
+    path = _status_path(store_path)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def read_latest_failures(store_path: str, limit: int = 200) -> Optional[dict]:
+    """The most recent write_failure_log() output for this store (there
+    can be several, one per run that had failures — picks the newest by
+    filename, which embeds a UTC timestamp). Returns None if there isn't
+    one. `limit` caps how many individual failure records come back (the
+    file itself is uncapped, matching CLI/GUI behavior) since a dashboard
+    panel isn't the place to render thousands of rows."""
+    candidates = sorted(glob.glob(f"{store_path}.failures_*.json"))
+    if not candidates:
+        return None
+    path = candidates[-1]
+    try:
+        with open(path) as fh:
+            failures = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return {
+        "path": path,
+        "total": len(failures),
+        "failures": failures[:limit],
+    }
 
 
 def estimate_run(config: Config, mode: str) -> dict:

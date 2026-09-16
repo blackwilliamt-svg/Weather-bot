@@ -178,19 +178,27 @@ droplet won't restart during the run.
 
 ### Checking progress remotely
 
+The easiest way to check on (or start/stop) a full pull without SSH at all is
+the "Droplet Pull" tab on the web dashboard — see "Phase 2: Modeling &
+Forecasting" below. Its Stop button works on the systemd-run pull too, not
+just one started from the dashboard itself. Everything below still works
+exactly as described if you'd rather use SSH directly:
+
 - **`journalctl -u weatherbot -f`** — live-tails the service's output (one
   line roughly every 9 seconds, matching the fixed pace) if you used systemd.
 - **`cat data/weather_archive.zarr.status.json`** (or
   `watch -n 30 cat data/weather_archive.zarr.status.json` to auto-refresh) —
   a small JSON snapshot updated after every batch: `step`/`total_steps`/
   `percent`, `bytes_downloaded`, `elapsed`/`eta`, and `failures_so_far`. This
-  works regardless of how you started the process.
+  works regardless of how you started the process — including the
+  dashboard's own Start button, which writes the exact same file — so it's
+  also what the dashboard tab itself is reading.
 - **`python -m weatherbot inventory --store data/weather_archive.zarr`** —
   the same inventory command as local use, run over SSH: point count, date
   range, variables, size on disk so far.
 - Failed grid points accumulate in `data/weather_archive.zarr.failures_*.json`
   as always (skip-and-log, not fatal) — check it once the run finishes, or
-  any time via `cat`.
+  any time via `cat`, or in the dashboard tab's failures list.
 
 ### Disk space — read this before starting
 
@@ -408,8 +416,17 @@ to re-run interactively from the dashboard on a small droplet.
 ```
 
 Opens on `http://127.0.0.1:8000` by default (`--host`/`--port` to change).
-Two panels:
+Three panels:
 
+- **Droplet pull** — Start/Stop buttons and a progress bar for the full
+  ingestion pull itself (points/requests fetched, bytes downloaded,
+  elapsed/ETA, and any failures), the GUI equivalent of `fetch --mode full`
+  plus everything in "Checking progress remotely" above. Works even before
+  any archive exists yet — Start on a brand-new store behaves exactly like
+  running the CLI/desktop-GUI full pull for the first time, same
+  checkpoint/resume and default spacing/compression/batching. See "Sharing
+  the pull with the systemd service" below for how Start/Stop interact with
+  a pull already running as `weatherbot.service`.
 - **Walk-forward training** — Start/Stop buttons, current phase/date/
   progress, and a live chart of MAE/RMSE as the model steps through history
   (or waits for more of it).
@@ -419,14 +436,45 @@ Two panels:
   they're generated, alongside a confidence-band chart building up the same
   way.
 
-Both processes run as background threads inside the dashboard server itself
-— stopping either just sets a flag the corresponding loop checks between
-steps (between one day of training, or one forecast day of simulation), so
-it always finishes its current step and checkpoints/exits cleanly rather
-than being killed mid-write. The dashboard polls its own small status
-endpoints roughly once a second rather than using websockets/SSE — simpler
-to run correctly on Flask's built-in server, and indistinguishable from
-"live" at that update rate.
+Training and simulation run as background threads inside the dashboard
+server itself — stopping either just sets a flag the corresponding loop
+checks between steps (between one day of training, or one forecast day of
+simulation), so it always finishes its current step and checkpoints/exits
+cleanly rather than being killed mid-write. The droplet pull tab's Stop
+works differently (see below) since the pull it's showing is often a
+separate process. The dashboard polls its own small status endpoints
+roughly once a second rather than using websockets/SSE — simpler to run
+correctly on Flask's built-in server, and indistinguishable from "live" at
+that update rate.
+
+#### Sharing the pull with the systemd service
+
+The droplet pull tab is built to coexist with `weatherbot.service` (or a
+plain CLI `fetch` run) rather than assume it owns the only thing writing to
+the store:
+
+- **Start** only ever launches a pull from the dashboard's own background
+  thread, and fails immediately with a clear message if a `FetchLock` is
+  already held elsewhere (`weatherbot.service`, another dashboard session,
+  a separate CLI invocation) — so it can't accidentally start a second
+  writer against the same store on top of one the systemd service already
+  started. If Start is greyed out, that's why; the status line above it
+  says which.
+- **Stop** works the other way: it doesn't send a signal to any process (the
+  dashboard may not even know that process's PID), it touches a small
+  cooperative flag file any running pull checks between batches — so it
+  halts a systemd-managed pull exactly as cleanly as a dashboard-started
+  one (finishes the in-flight batch, checkpoints, stops; fully resumable
+  either way).
+- **FetchLock is self-healing.** Unlike the walk-forward training lock (a
+  plain existence check, acceptable for that lower-stakes feature — see
+  `train.TrainingLock`), this one is a heartbeat: the lock file's mtime is
+  refreshed after every batch, and it's only considered "held" while that
+  heartbeat is under 10 minutes old. If the owning process dies uncleanly
+  (crash, OOM kill, power loss), the heartbeat simply stops updating and
+  the lock frees itself — nobody ever needs to SSH in and delete a stale
+  lock file by hand, which would otherwise undermine the "resumable after
+  any interruption" guarantee the rest of this project relies on.
 
 For headless training with no web UI (e.g. a minimal droplet, or debugging):
 

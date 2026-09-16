@@ -39,11 +39,17 @@
     display: inline-block; padding: 2px 9px; border-radius: 20px; font-size: 11px;
     font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
   }
-  .badge.catching_up { background: #33406b; color: #a9c1ff; }
-  .badge.live_wait { background: #1e4a34; color: var(--good); }
+  .badge.catching_up, .badge.running { background: #33406b; color: #a9c1ff; }
+  .badge.live_wait, .badge.complete { background: #1e4a34; color: var(--good); }
   .badge.stopped { background: #4a3520; color: var(--warn); }
   .badge.idle { background: #2a3450; color: var(--muted); }
   .badge.error { background: #4a1e1e; color: var(--bad); }
+  .progress-bar { background: var(--panel-2); border-radius: 6px; height: 10px; overflow: hidden; margin-bottom: 12px; }
+  .progress-bar-fill { background: var(--accent); height: 100%; width: 0%; transition: width .3s ease; }
+  table.failures { width: 100%; border-collapse: collapse; font-size: 12px; }
+  table.failures th, table.failures td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--border); }
+  table.failures th { color: var(--muted); font-weight: 600; }
+  .scroll-box { max-height: 220px; overflow-y: auto; border: 1px solid var(--border); border-radius: 6px; }
   .warning { background: #4a3520; color: var(--warn); padding: 8px 12px; border-radius: 6px; font-size: 12.5px; margin-bottom: 12px; }
   .error-box { background: #4a1e1e; color: var(--bad); padding: 8px 12px; border-radius: 6px; font-size: 12.5px; margin-bottom: 12px; }
   label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
@@ -67,9 +73,48 @@
 
 <h1>WeatherBot — Training &amp; Forecast Dashboard</h1>
 <p class="subtitle">
+  {% if store_exists %}
   {{ n_points }} grid points &middot; {{ variables|length }} variables &middot; store data {{ time_min }} .. {{ time_max }}
   &middot; <code>{{ store_path }}</code>
+  {% else %}
+  No archive at <code>{{ store_path }}</code> yet — start a full pull below.
+  {% endif %}
 </p>
+
+<div class="panel">
+  <h2>Droplet pull <span id="fetch-badge" class="badge idle">idle</span></h2>
+  <div class="controls">
+    <button id="fetch-start">Start full pull</button>
+    <button id="fetch-stop" class="stop">Stop</button>
+  </div>
+  <div class="status-line" id="fetch-status">Loading status...</div>
+  <div class="progress-bar"><div class="progress-bar-fill" id="fetch-progress-fill"></div></div>
+  <div class="stat-grid">
+    <div class="stat"><div class="v" id="fetch-percent">—</div><div class="l">Percent</div></div>
+    <div class="stat"><div class="v" id="fetch-steps">—</div><div class="l">Batches fetched</div></div>
+    <div class="stat"><div class="v" id="fetch-bytes">—</div><div class="l">Downloaded</div></div>
+    <div class="stat"><div class="v" id="fetch-elapsed">—</div><div class="l">Elapsed</div></div>
+    <div class="stat"><div class="v" id="fetch-eta">—</div><div class="l">ETA</div></div>
+    <div class="stat"><div class="v" id="fetch-failures">—</div><div class="l">Failures so far</div></div>
+  </div>
+  <div id="fetch-error"></div>
+  <div id="fetch-failures-box" class="scroll-box" style="display:none; margin-bottom: 10px;">
+    <table class="failures">
+      <thead><tr><th>Point</th><th>Lat, Lon</th><th>Time range</th><th>Reason</th></tr></thead>
+      <tbody id="fetch-failures-body"></tbody>
+    </table>
+  </div>
+  <p class="footer-note">
+    Estimate at current defaults: {{ "{:,}".format(fetch_estimate.n_points) }} points x
+    {{ "{:,}".format(fetch_estimate.n_days) }} days, {{ "{:,}".format(fetch_estimate.n_requests) }} requests.
+    This tab starts/stops the pull the same way the CLI and desktop GUI do (same checkpoint/resume logic, same
+    default spacing/compression/batching), and reads the same <code>&lt;store_path&gt;.status.json</code> the CLI
+    writes -- so if the pull is already running as the <code>weatherbot.service</code> systemd unit (see README
+    "Deploying the dashboard on a droplet"), Start is disabled and this tab just shows its live progress instead of
+    launching a second one. Stop works either way: it's a cooperative request any running pull checks between
+    batches, not a process signal, so it can halt the systemd-managed pull too, cleanly and resumably.
+  </p>
+</div>
 
 <div class="panel">
   <h2>Walk-forward training <span id="train-badge" class="badge idle">idle</span></h2>
@@ -170,6 +215,63 @@ function makeLineChart(ctx, opts) {
     }, opts.options || {}),
   });
 }
+
+// ---------- droplet pull panel ----------
+async function pollFetch() {
+  const res = await fetch('/api/fetch/status');
+  const s = await res.json();
+  const st = s.status; // pipeline.status.json contents, or null if never run
+
+  let phase = 'idle';
+  if (s.active) phase = 'running';
+  else if (st && st.percent >= 100) phase = 'complete';
+  const badge = document.getElementById('fetch-badge');
+  setBadge(badge, phase);
+
+  let who = '';
+  if (s.dashboard_started) who = ' (started from this dashboard)';
+  else if (s.external_active) who = ' (running elsewhere -- likely the systemd service)';
+  document.getElementById('fetch-status').innerHTML =
+    st ? `<b>${st.message || ''}</b>${who}` : 'No pull has run against this store yet.';
+
+  document.getElementById('fetch-progress-fill').style.width = (st ? st.percent : 0) + '%';
+  document.getElementById('fetch-percent').textContent = st ? st.percent.toFixed(1) + '%' : '—';
+  document.getElementById('fetch-steps').textContent = st ? `${st.step.toLocaleString()} / ${st.total_steps.toLocaleString()}` : '—';
+  document.getElementById('fetch-bytes').textContent = st ? st.bytes_downloaded_human : '—';
+  document.getElementById('fetch-elapsed').textContent = st ? st.elapsed_human : '—';
+  document.getElementById('fetch-eta').textContent = st ? st.eta_human : '—';
+  document.getElementById('fetch-failures').textContent = st ? st.failures_so_far : '—';
+
+  document.getElementById('fetch-error').innerHTML = s.error ? `<div class="error-box">${s.error}</div>` : '';
+
+  const box = document.getElementById('fetch-failures-box');
+  const body = document.getElementById('fetch-failures-body');
+  if (s.failures && s.failures.total > 0) {
+    box.style.display = 'block';
+    body.innerHTML = s.failures.failures.map(f =>
+      `<tr><td>${f.point_id}</td><td>${f.lat.toFixed(2)}, ${f.lon.toFixed(2)}</td><td>${f.time_range}</td><td>${f.reason}</td></tr>`
+    ).join('') + (s.failures.total > s.failures.failures.length
+      ? `<tr><td colspan="4">... and ${s.failures.total - s.failures.failures.length} more (see ${s.failures.path})</td></tr>` : '');
+  } else {
+    box.style.display = 'none';
+  }
+
+  document.getElementById('fetch-start').disabled = !!s.active;
+  document.getElementById('fetch-stop').disabled = !s.active;
+}
+
+document.getElementById('fetch-start').addEventListener('click', async () => {
+  const res = await fetch('/api/fetch/start', { method: 'POST' });
+  if (!res.ok) { const e = await res.json(); alert(e.error || 'Could not start the full pull.'); }
+  pollFetch();
+});
+document.getElementById('fetch-stop').addEventListener('click', async () => {
+  await fetch('/api/fetch/stop', { method: 'POST' });
+  pollFetch();
+});
+
+setInterval(pollFetch, 1000);
+pollFetch();
 
 // ---------- walk-forward training panel ----------
 const trainChart = makeLineChart(document.getElementById('train-chart').getContext('2d'), {

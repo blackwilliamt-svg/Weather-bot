@@ -11,12 +11,16 @@ User=YOUR_USERNAME
 WorkingDirectory=/home/YOUR_USERNAME/weatherbot
 ExecStart=/home/YOUR_USERNAME/weatherbot/.venv/bin/python -m weatherbot serve --host 0.0.0.0 --port 8000
 
-# Walk-forward training is only started when someone clicks "Start
-# training" in the dashboard (see README "Modeling & forecasting") -- it
-# is not auto-started by this service. Training checkpoints its position
-# and model weights periodically, so a restart -- crash, OOM kill, reboot
-# -- resumes from the last checkpoint instead of re-walking from 1990,
-# the same resumability the ingestion pipeline already relies on.
+# Walk-forward training and the droplet pull tab's full pull are only
+# started when someone clicks their Start button in the dashboard (see
+# README "Modeling & forecasting") -- neither is auto-started by this
+# service. If a full pull is instead driven by the separate
+# weatherbot.service unit, this dashboard's pull tab just shows its
+# progress and can Stop it -- see README "Sharing the pull with the
+# systemd service". Both training and fetch checkpoint their position
+# periodically, so a restart -- crash, OOM kill, reboot -- resumes from
+# the last checkpoint instead of starting over, the same resumability the
+# ingestion pipeline has always relied on.
 Restart=on-failure
 RestartSec=30
 
